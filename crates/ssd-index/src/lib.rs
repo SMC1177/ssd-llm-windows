@@ -8,6 +8,8 @@
 //! The v1 storage target is mmap-backed `.bin` files so the index itself
 //! lives on SSD with the same streaming discipline as model weights.
 
+pub mod embed;
+
 use serde::{Deserialize, Serialize};
 
 /// One indexable unit of text with provenance back to the source file.
