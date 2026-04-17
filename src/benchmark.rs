@@ -1,0 +1,886 @@
+//! Comprehensive Benchmark Suite for SSD-LLM
+//!
+//! v0.9: Structured benchmarking with JSON output, multiple scenarios,
+//! and comparative metrics for production performance analysis.
+//!
+//! Scenarios:
+//! - Cold start: first layer load from SSD (no OS page cache)
+//! - Warm cache: repeated layer loads (LRU cache hits)
+//! - Sequential streaming: layer-by-layer with prefetch
+//! - Prefill throughput: batch prefill simulation
+//! - Decode throughput: per-token forward pass estimation
+//!
+//! Output: human-readable table + optional JSON for CI/CD integration
+
+use crate::model::cache::LayerCache;
+use crate::model::gguf::GgufFile;
+use crate::ssd::streamer::SsdStreamer;
+use anyhow::Result;
+use std::path::Path;
+use std::time::Instant;
+
+/// Structured benchmark results
+#[derive(Debug, Clone)]
+pub struct BenchmarkResults {
+    pub model_info: ModelInfo,
+    pub scenarios: Vec<ScenarioResult>,
+    pub summary: BenchmarkSummary,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub path: String,
+    pub tensors: usize,
+    pub layers: u32,
+    pub n_embd: u32,
+    pub n_head: u32,
+    pub n_head_kv: u32,
+    pub vocab_size: u32,
+    pub file_size_bytes: u64,
+    pub architecture: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScenarioResult {
+    pub name: String,
+    pub description: String,
+    pub metrics: Vec<Metric>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Metric {
+    pub name: String,
+    pub value: f64,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BenchmarkSummary {
+    pub total_duration_ms: f64,
+    pub est_prefill_tok_per_sec: f64,
+    pub est_decode_tok_per_sec: f64,
+    pub ssd_bandwidth_mb_per_sec: f64,
+    pub memory_budget_bytes: usize,
+    pub cache_efficiency_pct: f64,
+}
+
+impl BenchmarkResults {
+    pub fn to_json(&self) -> String {
+        let mut json = String::from("{\n");
+
+        // Model info
+        json.push_str("  \"model\": {\n");
+        json.push_str(&format!(
+            "    \"path\": \"{}\",\n",
+            escape_json(&self.model_info.path)
+        ));
+        json.push_str(&format!(
+            "    \"architecture\": \"{}\",\n",
+            self.model_info.architecture
+        ));
+        json.push_str(&format!("    \"tensors\": {},\n", self.model_info.tensors));
+        json.push_str(&format!("    \"layers\": {},\n", self.model_info.layers));
+        json.push_str(&format!("    \"n_embd\": {},\n", self.model_info.n_embd));
+        json.push_str(&format!("    \"n_head\": {},\n", self.model_info.n_head));
+        json.push_str(&format!(
+            "    \"n_head_kv\": {},\n",
+            self.model_info.n_head_kv
+        ));
+        json.push_str(&format!(
+            "    \"vocab_size\": {},\n",
+            self.model_info.vocab_size
+        ));
+        json.push_str(&format!(
+            "    \"file_size_bytes\": {}\n",
+            self.model_info.file_size_bytes
+        ));
+        json.push_str("  },\n");
+
+        // Scenarios
+        json.push_str("  \"scenarios\": [\n");
+        for (i, s) in self.scenarios.iter().enumerate() {
+            json.push_str("    {\n");
+            json.push_str(&format!("      \"name\": \"{}\",\n", escape_json(&s.name)));
+            json.push_str(&format!(
+                "      \"description\": \"{}\",\n",
+                escape_json(&s.description)
+            ));
+            json.push_str("      \"metrics\": {\n");
+            for (j, m) in s.metrics.iter().enumerate() {
+                let comma = if j + 1 < s.metrics.len() { "," } else { "" };
+                json.push_str(&format!(
+                    "        \"{}\": {{ \"value\": {:.4}, \"unit\": \"{}\" }}{}\n",
+                    escape_json(&m.name),
+                    m.value,
+                    escape_json(&m.unit),
+                    comma
+                ));
+            }
+            json.push_str("      }\n");
+            let comma = if i + 1 < self.scenarios.len() {
+                ","
+            } else {
+                ""
+            };
+            json.push_str(&format!("    }}{}\n", comma));
+        }
+        json.push_str("  ],\n");
+
+        // Summary
+        json.push_str("  \"summary\": {\n");
+        json.push_str(&format!(
+            "    \"total_duration_ms\": {:.2},\n",
+            self.summary.total_duration_ms
+        ));
+        json.push_str(&format!(
+            "    \"est_prefill_tok_per_sec\": {:.1},\n",
+            self.summary.est_prefill_tok_per_sec
+        ));
+        json.push_str(&format!(
+            "    \"est_decode_tok_per_sec\": {:.1},\n",
+            self.summary.est_decode_tok_per_sec
+        ));
+        json.push_str(&format!(
+            "    \"ssd_bandwidth_mb_per_sec\": {:.0},\n",
+            self.summary.ssd_bandwidth_mb_per_sec
+        ));
+        json.push_str(&format!(
+            "    \"memory_budget_bytes\": {},\n",
+            self.summary.memory_budget_bytes
+        ));
+        json.push_str(&format!(
+            "    \"cache_efficiency_pct\": {:.1}\n",
+            self.summary.cache_efficiency_pct
+        ));
+        json.push_str("  }\n");
+
+        json.push_str("}\n");
+        json
+    }
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Run the full benchmark suite
+pub fn run_benchmark(model_path: &Path, budget: usize) -> Result<()> {
+    let results = run_benchmark_structured(model_path, budget)?;
+    print_results(&results);
+    Ok(())
+}
+
+/// Run benchmark with structured output (for JSON export)
+pub fn run_benchmark_structured(model_path: &Path, budget: usize) -> Result<BenchmarkResults> {
+    let total_start = Instant::now();
+
+    // Parse GGUF
+    let parse_start = Instant::now();
+    let gguf = GgufFile::open(model_path)?;
+    let parse_time = parse_start.elapsed();
+
+    let model_info = ModelInfo {
+        path: model_path.display().to_string(),
+        tensors: gguf.tensors.len(),
+        layers: gguf.n_layers(),
+        n_embd: gguf.n_embd(),
+        n_head: gguf.n_head(),
+        n_head_kv: gguf.n_head_kv(),
+        vocab_size: gguf.vocab_size(),
+        file_size_bytes: gguf.file_size,
+        architecture: gguf.architecture().to_string(),
+    };
+
+    let streamer = SsdStreamer::new(model_path, budget)?;
+    let n_layers = gguf.n_layers();
+    let mut scenarios = Vec::new();
+
+    // Scenario 1: GGUF Parse
+    scenarios.push(ScenarioResult {
+        name: "gguf_parse".to_string(),
+        description: "GGUF file parsing and metadata extraction".to_string(),
+        metrics: vec![
+            Metric {
+                name: "parse_time_ms".into(),
+                value: parse_time.as_secs_f64() * 1000.0,
+                unit: "ms".into(),
+            },
+            Metric {
+                name: "tensor_count".into(),
+                value: gguf.tensors.len() as f64,
+                unit: "count".into(),
+            },
+            Metric {
+                name: "metadata_count".into(),
+                value: gguf.metadata.len() as f64,
+                unit: "count".into(),
+            },
+        ],
+    });
+
+    let mut avg_bandwidth = 0.0f64;
+    let mut cache_efficiency = 0.0f64;
+
+    if n_layers > 0 {
+        // Scenario 2: Cold layer load
+        let start = Instant::now();
+        let layer = streamer.load_layer(&gguf, 0)?;
+        let cold_time = start.elapsed();
+        let layer_size_mb = layer.size_bytes as f64 / (1024.0 * 1024.0);
+        let cold_bandwidth = layer_size_mb / cold_time.as_secs_f64();
+
+        scenarios.push(ScenarioResult {
+            name: "cold_load".to_string(),
+            description: "First layer load from SSD (cold, no page cache benefit)".to_string(),
+            metrics: vec![
+                Metric {
+                    name: "layer_size_mb".into(),
+                    value: layer_size_mb,
+                    unit: "MB".into(),
+                },
+                Metric {
+                    name: "load_time_ms".into(),
+                    value: cold_time.as_secs_f64() * 1000.0,
+                    unit: "ms".into(),
+                },
+                Metric {
+                    name: "bandwidth_mb_s".into(),
+                    value: cold_bandwidth,
+                    unit: "MB/s".into(),
+                },
+            ],
+        });
+
+        // Scenario 3: Sequential streaming with prefetch
+        let mut cache = LayerCache::new(budget);
+        let layers_to_bench = (n_layers as usize).min(10);
+        let start = Instant::now();
+        let mut total_bytes = 0u64;
+
+        for i in 0..layers_to_bench {
+            if i + 1 < n_layers as usize {
+                streamer.prefetch_layer(&gguf, (i + 1) as u32);
+            }
+            let layer = streamer.load_layer(&gguf, i as u32)?;
+            total_bytes += layer.size_bytes as u64;
+            cache.insert(i as u32, layer);
+        }
+
+        let seq_time = start.elapsed();
+        let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
+        avg_bandwidth = total_mb / seq_time.as_secs_f64();
+        let avg_per_layer = seq_time.as_secs_f64() * 1000.0 / layers_to_bench as f64;
+
+        scenarios.push(ScenarioResult {
+            name: "sequential_stream".to_string(),
+            description: format!(
+                "Sequential load of {} layers with prefetch",
+                layers_to_bench
+            ),
+            metrics: vec![
+                Metric {
+                    name: "layers_loaded".into(),
+                    value: layers_to_bench as f64,
+                    unit: "count".into(),
+                },
+                Metric {
+                    name: "total_mb".into(),
+                    value: total_mb,
+                    unit: "MB".into(),
+                },
+                Metric {
+                    name: "total_time_ms".into(),
+                    value: seq_time.as_secs_f64() * 1000.0,
+                    unit: "ms".into(),
+                },
+                Metric {
+                    name: "avg_per_layer_ms".into(),
+                    value: avg_per_layer,
+                    unit: "ms".into(),
+                },
+                Metric {
+                    name: "bandwidth_mb_s".into(),
+                    value: avg_bandwidth,
+                    unit: "MB/s".into(),
+                },
+            ],
+        });
+
+        // Scenario 4: Warm cache (re-read same layers)
+        let start = Instant::now();
+        let mut cache_hits = 0usize;
+        for i in 0..layers_to_bench {
+            if cache.get(i as u32).is_some() {
+                cache_hits += 1;
+            }
+        }
+        let warm_time = start.elapsed();
+        cache_efficiency = cache_hits as f64 / layers_to_bench as f64 * 100.0;
+
+        scenarios.push(ScenarioResult {
+            name: "warm_cache".to_string(),
+            description: "Layer access from LRU cache (no SSD I/O)".to_string(),
+            metrics: vec![
+                Metric {
+                    name: "lookups".into(),
+                    value: layers_to_bench as f64,
+                    unit: "count".into(),
+                },
+                Metric {
+                    name: "hits".into(),
+                    value: cache_hits as f64,
+                    unit: "count".into(),
+                },
+                Metric {
+                    name: "hit_rate_pct".into(),
+                    value: cache_efficiency,
+                    unit: "%".into(),
+                },
+                Metric {
+                    name: "lookup_time_us".into(),
+                    value: warm_time.as_secs_f64() * 1_000_000.0,
+                    unit: "µs".into(),
+                },
+            ],
+        });
+
+        // Scenario 5: Full model forward pass estimate
+        let total_model_mb =
+            gguf.tensors.iter().map(|t| t.size_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
+        let est_full_time = total_model_mb / avg_bandwidth;
+
+        scenarios.push(ScenarioResult {
+            name: "forward_pass_estimate".to_string(),
+            description: "Estimated full forward pass timing (I/O bound)".to_string(),
+            metrics: vec![
+                Metric {
+                    name: "total_model_mb".into(),
+                    value: total_model_mb,
+                    unit: "MB".into(),
+                },
+                Metric {
+                    name: "total_model_gb".into(),
+                    value: total_model_mb / 1024.0,
+                    unit: "GB".into(),
+                },
+                Metric {
+                    name: "est_forward_pass_s".into(),
+                    value: est_full_time,
+                    unit: "s".into(),
+                },
+                Metric {
+                    name: "est_decode_tok_s".into(),
+                    value: 1.0 / est_full_time,
+                    unit: "tok/s".into(),
+                },
+                Metric {
+                    name: "est_prefill_tok_s".into(),
+                    value: n_layers as f64 / est_full_time,
+                    unit: "tok/s".into(),
+                },
+            ],
+        });
+
+        // Scenario 6: Cache budget analysis
+        let layers_in_budget =
+            (budget as f64 / (total_model_mb * 1024.0 * 1024.0 / n_layers as f64)) as usize;
+        let pct_cached = (layers_in_budget as f64 / n_layers as f64 * 100.0).min(100.0);
+
+        scenarios.push(ScenarioResult {
+            name: "cache_analysis".to_string(),
+            description: "Memory budget vs model size analysis".to_string(),
+            metrics: vec![
+                Metric {
+                    name: "budget_gb".into(),
+                    value: budget as f64 / (1024.0 * 1024.0 * 1024.0),
+                    unit: "GB".into(),
+                },
+                Metric {
+                    name: "model_gb".into(),
+                    value: total_model_mb / 1024.0,
+                    unit: "GB".into(),
+                },
+                Metric {
+                    name: "layers_in_budget".into(),
+                    value: layers_in_budget as f64,
+                    unit: "layers".into(),
+                },
+                Metric {
+                    name: "pct_cached".into(),
+                    value: pct_cached,
+                    unit: "%".into(),
+                },
+                Metric {
+                    name: "cache_used_mb".into(),
+                    value: cache.used_bytes() as f64 / (1024.0 * 1024.0),
+                    unit: "MB".into(),
+                },
+                Metric {
+                    name: "cache_hits".into(),
+                    value: cache.stats().hits as f64,
+                    unit: "count".into(),
+                },
+                Metric {
+                    name: "cache_misses".into(),
+                    value: cache.stats().misses as f64,
+                    unit: "count".into(),
+                },
+                Metric {
+                    name: "cache_evictions".into(),
+                    value: cache.stats().evictions as f64,
+                    unit: "count".into(),
+                },
+            ],
+        });
+    }
+
+    let total_duration = total_start.elapsed();
+
+    // Compute summary estimates
+    let total_model_mb =
+        gguf.tensors.iter().map(|t| t.size_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
+    let est_forward = if avg_bandwidth > 0.0 {
+        total_model_mb / avg_bandwidth
+    } else {
+        0.0
+    };
+
+    let summary = BenchmarkSummary {
+        total_duration_ms: total_duration.as_secs_f64() * 1000.0,
+        est_prefill_tok_per_sec: if est_forward > 0.0 {
+            n_layers as f64 / est_forward
+        } else {
+            0.0
+        },
+        est_decode_tok_per_sec: if est_forward > 0.0 {
+            1.0 / est_forward
+        } else {
+            0.0
+        },
+        ssd_bandwidth_mb_per_sec: avg_bandwidth,
+        memory_budget_bytes: budget,
+        cache_efficiency_pct: cache_efficiency,
+    };
+
+    Ok(BenchmarkResults {
+        model_info,
+        scenarios,
+        summary,
+    })
+}
+
+fn print_results(results: &BenchmarkResults) {
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║              ssd-llm Benchmark Suite v0.9.0                ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+
+    let mi = &results.model_info;
+    println!("║ Model: {:<52} ║", truncate(&mi.path, 52));
+    println!(
+        "║ Arch: {:<12}  Layers: {:<5}  Embd: {:<6}  Heads: {}/{:<3}║",
+        mi.architecture, mi.layers, mi.n_embd, mi.n_head, mi.n_head_kv
+    );
+    println!(
+        "║ Tensors: {:<8}  Size: {:.2} GB  Vocab: {:<17}║",
+        mi.tensors,
+        mi.file_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        mi.vocab_size
+    );
+    println!("╠══════════════════════════════════════════════════════════════╣");
+
+    for scenario in &results.scenarios {
+        println!("║ {:^60} ║", scenario.name.to_uppercase());
+        println!("║ {:<60} ║", truncate(&scenario.description, 60));
+        for m in &scenario.metrics {
+            let val_str = if m.value > 1000.0 {
+                format!("{:.0}", m.value)
+            } else if m.value > 1.0 {
+                format!("{:.2}", m.value)
+            } else {
+                format!("{:.4}", m.value)
+            };
+            println!("║   {:<30} {:>15} {:<10} ║", m.name, val_str, m.unit);
+        }
+        println!("╠══════════════════════════════════════════════════════════════╣");
+    }
+
+    let s = &results.summary;
+    println!("║                        SUMMARY                              ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!(
+        "║  SSD Bandwidth:      {:>10.0} MB/s                       ║",
+        s.ssd_bandwidth_mb_per_sec
+    );
+    println!(
+        "║  Est. Decode:        {:>10.1} tok/s                      ║",
+        s.est_decode_tok_per_sec
+    );
+    println!(
+        "║  Est. Prefill:       {:>10.1} tok/s                      ║",
+        s.est_prefill_tok_per_sec
+    );
+    println!(
+        "║  Cache Efficiency:   {:>10.1}%                           ║",
+        s.cache_efficiency_pct
+    );
+    println!(
+        "║  Memory Budget:      {:>10.2} GB                         ║",
+        s.memory_budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+    println!(
+        "║  Total Bench Time:   {:>10.2} ms                         ║",
+        s.total_duration_ms
+    );
+    println!("╚══════════════════════════════════════════════════════════════╝");
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("...{}", &s[s.len() - max + 3..])
+    }
+}
+
+/// Run benchmark and return JSON string
+pub fn run_benchmark_json(model_path: &Path, budget: usize) -> Result<String> {
+    let results = run_benchmark_structured(model_path, budget)?;
+    Ok(results.to_json())
+}
+
+/// Generate a markdown benchmark report
+pub fn run_benchmark_markdown(model_path: &Path, budget: usize) -> Result<String> {
+    let results = run_benchmark_structured(model_path, budget)?;
+    Ok(results.to_markdown())
+}
+
+impl BenchmarkResults {
+    /// Render results as a markdown report
+    pub fn to_markdown(&self) -> String {
+        let mut md = String::new();
+
+        md.push_str("# ssd-llm Benchmark Report\n\n");
+        md.push_str("## Model Information\n\n");
+        md.push_str("| Property | Value |\n");
+        md.push_str("|----------|-------|\n");
+        md.push_str(&format!(
+            "| Architecture | {} |\n",
+            self.model_info.architecture
+        ));
+        md.push_str(&format!("| Layers | {} |\n", self.model_info.layers));
+        md.push_str(&format!("| Embedding dim | {} |\n", self.model_info.n_embd));
+        md.push_str(&format!(
+            "| Heads (Q/KV) | {} / {} |\n",
+            self.model_info.n_head, self.model_info.n_head_kv
+        ));
+        md.push_str(&format!(
+            "| Vocab size | {} |\n",
+            self.model_info.vocab_size
+        ));
+        md.push_str(&format!("| Tensors | {} |\n", self.model_info.tensors));
+        md.push_str(&format!(
+            "| File size | {:.2} GB |\n\n",
+            self.model_info.file_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        ));
+
+        md.push_str("## Benchmark Scenarios\n\n");
+
+        for scenario in &self.scenarios {
+            md.push_str(&format!("### {}\n\n", scenario.name));
+            md.push_str(&format!("_{}_\n\n", scenario.description));
+            md.push_str("| Metric | Value | Unit |\n");
+            md.push_str("|--------|------:|------|\n");
+            for m in &scenario.metrics {
+                let val_str = if m.value > 1000.0 {
+                    format!("{:.0}", m.value)
+                } else if m.value > 1.0 {
+                    format!("{:.2}", m.value)
+                } else {
+                    format!("{:.4}", m.value)
+                };
+                md.push_str(&format!("| {} | {} | {} |\n", m.name, val_str, m.unit));
+            }
+            md.push('\n');
+        }
+
+        md.push_str("## Summary\n\n");
+        md.push_str("| Metric | Value |\n");
+        md.push_str("|--------|------:|\n");
+        md.push_str(&format!(
+            "| SSD Bandwidth | {:.0} MB/s |\n",
+            self.summary.ssd_bandwidth_mb_per_sec
+        ));
+        md.push_str(&format!(
+            "| Est. Decode | {:.1} tok/s |\n",
+            self.summary.est_decode_tok_per_sec
+        ));
+        md.push_str(&format!(
+            "| Est. Prefill | {:.1} tok/s |\n",
+            self.summary.est_prefill_tok_per_sec
+        ));
+        md.push_str(&format!(
+            "| Cache Efficiency | {:.1}% |\n",
+            self.summary.cache_efficiency_pct
+        ));
+        md.push_str(&format!(
+            "| Memory Budget | {:.2} GB |\n",
+            self.summary.memory_budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        ));
+        md.push_str(&format!(
+            "| Total Bench Time | {:.2} ms |\n\n",
+            self.summary.total_duration_ms
+        ));
+
+        md
+    }
+}
+
+/// Quantization comparison results for the benchmark report
+#[derive(Debug, Clone)]
+pub struct QuantComparison {
+    pub bit_width: u32,
+    pub group_size: usize,
+    pub alpha: f32,
+    pub mse: f64,
+    pub snr_db: f64,
+    pub compression_ratio: f64,
+    pub matvec_us: f64,
+    pub memory_bytes: usize,
+}
+
+/// Run AWQ quantization benchmark comparing different bit widths
+/// Uses synthetic weights for measurement (no model file needed)
+pub fn benchmark_quantization_levels(d_out: usize, d_in: usize) -> Vec<QuantComparison> {
+    use crate::inference::awq::{
+        measure_quantization_error, quantize_awq, ActivationStats, AwqConfig,
+    };
+
+    let mut results = Vec::new();
+
+    // Generate deterministic synthetic weights
+    let mut weights = vec![0.0f32; d_out * d_in];
+    let mut state = 42u64;
+    for w in weights.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *w = ((state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32 * 0.5;
+    }
+
+    // Generate synthetic activation stats
+    let mut stats = ActivationStats::new(d_in);
+    let mut act = vec![0.0f32; d_in];
+    for (i, a) in act.iter_mut().enumerate() {
+        // Power-law distribution: few channels have large activations
+        *a = (1.0 + i as f32).powf(-0.5) * 10.0;
+    }
+    stats.update(&act, d_in);
+
+    for &bits in &[2u32, 3, 4, 8] {
+        for &alpha in &[0.0f32, 0.5] {
+            let config = AwqConfig {
+                bits,
+                group_size: 128,
+                alpha,
+                calibration_samples: 1,
+                clip: true,
+                clip_steps: 20,
+            };
+
+            if let Ok(qw) = quantize_awq(&weights, d_out, d_in, &stats, &config) {
+                let err = measure_quantization_error(&weights, &qw);
+                let input: Vec<f32> = (0..d_in).map(|i| (i as f32 * 0.01).sin()).collect();
+
+                let start = std::time::Instant::now();
+                let iterations = 10;
+                for _ in 0..iterations {
+                    let _ = qw.matvec(&input);
+                }
+                let elapsed = start.elapsed();
+
+                results.push(QuantComparison {
+                    bit_width: bits,
+                    group_size: 128,
+                    alpha,
+                    mse: err.mse,
+                    snr_db: err.snr_db,
+                    compression_ratio: qw.compression_ratio(),
+                    matvec_us: elapsed.as_micros() as f64 / iterations as f64,
+                    memory_bytes: qw.size_bytes(),
+                });
+            }
+        }
+    }
+
+    results
+}
+
+/// Generate markdown report comparing quantization levels
+pub fn quantization_report_markdown(d_out: usize, d_in: usize) -> String {
+    let results = benchmark_quantization_levels(d_out, d_in);
+    let mut md = String::new();
+
+    md.push_str("# AWQ Quantization Comparison Report\n\n");
+    md.push_str(&format!(
+        "Matrix size: {}×{} ({:.2} MB f32)\n\n",
+        d_out,
+        d_in,
+        (d_out * d_in * 4) as f64 / (1024.0 * 1024.0)
+    ));
+    md.push_str("| Bits | Alpha | Compression | MSE | SNR (dB) | MatVec (µs) | Memory |\n");
+    md.push_str("|-----:|------:|------------:|----:|---------:|------------:|-------:|\n");
+
+    for r in &results {
+        let alpha_str = if r.alpha < 0.01 {
+            "RTN".to_string()
+        } else {
+            format!("{:.1}", r.alpha)
+        };
+        md.push_str(&format!(
+            "| {} | {} | {:.1}x | {:.2e} | {:.1} | {:.0} | {:.2} KB |\n",
+            r.bit_width,
+            alpha_str,
+            r.compression_ratio,
+            r.mse,
+            r.snr_db,
+            r.matvec_us,
+            r.memory_bytes as f64 / 1024.0,
+        ));
+    }
+
+    md.push_str(
+        "\n_RTN = Round-to-Nearest (no activation awareness), Alpha = AWQ scaling exponent_\n",
+    );
+    md
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_benchmark_results_to_json() {
+        let results = BenchmarkResults {
+            model_info: ModelInfo {
+                path: "test.gguf".into(),
+                tensors: 100,
+                layers: 32,
+                n_embd: 4096,
+                n_head: 32,
+                n_head_kv: 8,
+                vocab_size: 32000,
+                file_size_bytes: 4_000_000_000,
+                architecture: "llama".into(),
+            },
+            scenarios: vec![ScenarioResult {
+                name: "cold_load".into(),
+                description: "Cold layer load".into(),
+                metrics: vec![Metric {
+                    name: "load_time_ms".into(),
+                    value: 5.5,
+                    unit: "ms".into(),
+                }],
+            }],
+            summary: BenchmarkSummary {
+                total_duration_ms: 100.0,
+                est_prefill_tok_per_sec: 50.0,
+                est_decode_tok_per_sec: 10.0,
+                ssd_bandwidth_mb_per_sec: 3000.0,
+                memory_budget_bytes: 8_589_934_592,
+                cache_efficiency_pct: 95.0,
+            },
+        };
+
+        let json = results.to_json();
+        assert!(json.contains("\"architecture\": \"llama\""));
+        assert!(json.contains("\"cold_load\""));
+        assert!(json.contains("\"est_decode_tok_per_sec\""));
+    }
+
+    #[test]
+    fn test_truncate() {
+        assert_eq!(truncate("short", 20), "short");
+        assert_eq!(
+            truncate("a very long string that should be truncated", 20),
+            "...ould be truncated"
+        );
+    }
+
+    #[test]
+    fn test_escape_json() {
+        assert_eq!(escape_json("hello\"world"), "hello\\\"world");
+        assert_eq!(escape_json("line\nnewline"), "line\\nnewline");
+    }
+
+    #[test]
+    fn test_benchmark_results_to_markdown() {
+        let results = BenchmarkResults {
+            model_info: ModelInfo {
+                path: "test.gguf".into(),
+                tensors: 100,
+                layers: 32,
+                n_embd: 4096,
+                n_head: 32,
+                n_head_kv: 8,
+                vocab_size: 32000,
+                file_size_bytes: 4_000_000_000,
+                architecture: "llama".into(),
+            },
+            scenarios: vec![ScenarioResult {
+                name: "cold_load".into(),
+                description: "Cold layer load test".into(),
+                metrics: vec![Metric {
+                    name: "load_time_ms".into(),
+                    value: 5.5,
+                    unit: "ms".into(),
+                }],
+            }],
+            summary: BenchmarkSummary {
+                total_duration_ms: 100.0,
+                est_prefill_tok_per_sec: 50.0,
+                est_decode_tok_per_sec: 10.0,
+                ssd_bandwidth_mb_per_sec: 3000.0,
+                memory_budget_bytes: 8_589_934_592,
+                cache_efficiency_pct: 95.0,
+            },
+        };
+
+        let md = results.to_markdown();
+        assert!(md.contains("# ssd-llm Benchmark Report"));
+        assert!(md.contains("| Architecture | llama |"));
+        assert!(md.contains("### cold_load"));
+        assert!(md.contains("| SSD Bandwidth |"));
+    }
+
+    #[test]
+    fn test_benchmark_quantization_levels() {
+        let results = benchmark_quantization_levels(64, 64);
+        assert!(!results.is_empty());
+        // Should have results for 2, 3, 4, 8 bits × 2 alpha values = 8
+        assert_eq!(results.len(), 8);
+        // Higher bits should have lower MSE
+        let mse_4bit: f64 = results
+            .iter()
+            .filter(|r| r.bit_width == 4 && r.alpha < 0.01)
+            .map(|r| r.mse)
+            .next()
+            .unwrap_or(0.0);
+        let mse_8bit: f64 = results
+            .iter()
+            .filter(|r| r.bit_width == 8 && r.alpha < 0.01)
+            .map(|r| r.mse)
+            .next()
+            .unwrap_or(0.0);
+        assert!(mse_8bit <= mse_4bit, "8-bit should have <= MSE than 4-bit");
+    }
+
+    #[test]
+    fn test_quantization_report_markdown() {
+        let md = quantization_report_markdown(32, 32);
+        assert!(md.contains("# AWQ Quantization Comparison Report"));
+        assert!(md.contains("| Bits |"));
+        assert!(md.contains("RTN"));
+    }
+}

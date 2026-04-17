@@ -1,0 +1,3712 @@
+//! Metal Compute Pipeline for Apple Silicon GPU acceleration
+//!
+//! Provides GPU-accelerated matrix operations using Metal compute shaders.
+//! Falls back to optimized CPU SIMD paths when Metal is unavailable or for small tensors.
+//!
+//! v1.14: Added Q3_K and Q5_K dequantization (CPU + Metal GPU shaders).
+//! v0.3: Added Metal shader compilation, GPU dispatch for matvec/rmsnorm/softmax,
+//!       and quantized Q4_0/Q8_0 on-GPU dequant+matmul kernels.
+
+use crate::metal::gpu::MetalGpu;
+use crate::model::gguf::GgmlType;
+use tracing::{debug, info, warn};
+
+/// Threshold below which CPU is faster than GPU dispatch overhead
+const GPU_DISPATCH_THRESHOLD: usize = 4096;
+
+/// Metal compute context for GPU-accelerated operations
+pub struct MetalCompute {
+    available: bool,
+    /// Pre-compiled shader library path
+    shader_lib: Option<String>,
+    /// Real Metal GPU context (v0.4)
+    gpu: Option<MetalGpu>,
+}
+
+unsafe impl Send for MetalCompute {}
+unsafe impl Sync for MetalCompute {}
+
+impl MetalCompute {
+    /// Check if Metal is available on this system
+    pub fn is_available() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("system_profiler")
+                .arg("SPDisplaysDataType")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains("Metal"))
+                .unwrap_or(false)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// Create a new Metal compute context, compiling shaders if possible
+    pub fn new() -> Option<Self> {
+        if !Self::is_available() {
+            warn!("Metal not available, falling back to CPU");
+            return None;
+        }
+
+        // Try to compile Metal shaders
+        let shader_lib = Self::compile_shaders();
+
+        // Try to initialize real GPU dispatch via metal-rs
+        let gpu = MetalGpu::new();
+        if gpu.is_some() {
+            info!("Metal GPU acceleration ready (metal-rs pipelines compiled)");
+        } else if shader_lib.is_some() {
+            info!("Metal GPU acceleration ready (shaders compiled, CPU dispatch)");
+        } else {
+            info!("Metal GPU available (using CPU SIMD)");
+        }
+
+        Some(Self {
+            available: true,
+            shader_lib,
+            gpu,
+        })
+    }
+
+    /// Compile Metal shaders to a .metallib
+    fn compile_shaders() -> Option<String> {
+        let shader_src = include_str!("shaders/kernels.metal");
+        let tmp_dir = std::env::temp_dir().join("ssd-llm-metal");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+
+        let metal_path = tmp_dir.join("kernels.metal");
+        let air_path = tmp_dir.join("kernels.air");
+        let lib_path = tmp_dir.join("kernels.metallib");
+
+        // Write shader source
+        if std::fs::write(&metal_path, shader_src).is_err() {
+            return None;
+        }
+
+        // Compile to .air (Metal IR)
+        let status = std::process::Command::new("xcrun")
+            .args([
+                "-sdk",
+                "macosx",
+                "metal",
+                "-c",
+                metal_path.to_str()?,
+                "-o",
+                air_path.to_str()?,
+            ])
+            .output();
+
+        match status {
+            Ok(output) if output.status.success() => {
+                debug!("Metal shaders compiled to AIR");
+            }
+            Ok(output) => {
+                warn!(
+                    "Metal shader compilation failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return None;
+            }
+            Err(e) => {
+                warn!("xcrun not found: {}", e);
+                return None;
+            }
+        }
+
+        // Link to .metallib
+        let status = std::process::Command::new("xcrun")
+            .args([
+                "-sdk",
+                "macosx",
+                "metallib",
+                air_path.to_str()?,
+                "-o",
+                lib_path.to_str()?,
+            ])
+            .output();
+
+        match status {
+            Ok(output) if output.status.success() => {
+                info!("Metal shader library built: {}", lib_path.display());
+                Some(lib_path.to_string_lossy().to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if GPU dispatch is beneficial for this operation size
+    pub fn should_use_gpu(&self, elements: usize) -> bool {
+        self.available && self.shader_lib.is_some() && elements >= GPU_DISPATCH_THRESHOLD
+    }
+
+    /// GPU-accelerated matrix-vector multiply (falls back to SIMD CPU)
+    pub fn matvec_f32(&self, w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        #[cfg(target_os = "macos")]
+        if let Some(ref gpu) = self.gpu {
+            if gpu.should_dispatch(out_dim * in_dim) {
+                return gpu.matvec_f32(w, x, out_dim, in_dim);
+            }
+        }
+        matvec_f32_simd(w, x, out_dim, in_dim)
+    }
+
+    /// Quantized matrix-vector multiply with automatic dispatch by type
+    /// Supports Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, Q4_0, Q8_0 on GPU; falls back to CPU for others
+    pub fn matvec_quantized(
+        &self,
+        w_raw: &[u8],
+        x: &[f32],
+        out_dim: usize,
+        in_dim: usize,
+        dtype: GgmlType,
+    ) -> Vec<f32> {
+        #[cfg(target_os = "macos")]
+        if let Some(ref gpu) = self.gpu {
+            if gpu.should_dispatch(out_dim * in_dim) {
+                match dtype {
+                    GgmlType::Q4_0 => return gpu.matvec_q4_0(w_raw, x, out_dim, in_dim),
+                    GgmlType::Q3K => return gpu.matvec_q3_k(w_raw, x, out_dim, in_dim),
+                    GgmlType::Q4K => return gpu.matvec_q4_k(w_raw, x, out_dim, in_dim),
+                    GgmlType::Q5K => return gpu.matvec_q5_k(w_raw, x, out_dim, in_dim),
+                    GgmlType::Q6K => return gpu.matvec_q6_k(w_raw, x, out_dim, in_dim),
+                    GgmlType::Q8_0 => return gpu.matvec_q8_0(w_raw, x, out_dim, in_dim),
+                    GgmlType::Q2K => return gpu.matvec_q2_k(w_raw, x, out_dim, in_dim),
+                    GgmlType::Q8K => return gpu.matvec_q8_k(w_raw, x, out_dim, in_dim),
+                    GgmlType::IQ4NL => return gpu.matvec_iq4_nl(w_raw, x, out_dim, in_dim),
+                    GgmlType::IQ4XS => return gpu.matvec_iq4_xs(w_raw, x, out_dim, in_dim),
+                    GgmlType::IQ3XXS => return gpu.matvec_iq3_xxs(w_raw, x, out_dim, in_dim),
+                    GgmlType::IQ3S => return gpu.matvec_iq3_s(w_raw, x, out_dim, in_dim),
+                    GgmlType::IQ2XXS => return gpu.matvec_iq2_xxs(w_raw, x, out_dim, in_dim),
+                    GgmlType::IQ2XS => return gpu.matvec_iq2_xs(w_raw, x, out_dim, in_dim),
+                    GgmlType::BF16 => return gpu.matvec_bf16(w_raw, x, out_dim, in_dim),
+                    GgmlType::F16 => return gpu.matvec_f16(w_raw, x, out_dim, in_dim),
+                    _ => {}
+                }
+            }
+        }
+        // CPU fallback
+        matvec_quantized_cpu(w_raw, x, out_dim, in_dim, dtype)
+    }
+
+    pub fn rmsnorm_f32(&self, x: &mut [f32], weight: &[f32], eps: f32) {
+        #[cfg(target_os = "macos")]
+        if let Some(ref gpu) = self.gpu {
+            if gpu.should_dispatch(x.len()) {
+                gpu.rmsnorm_f32(x, weight, eps);
+                return;
+            }
+        }
+        rmsnorm_f32_fast(x, weight, eps);
+    }
+
+    pub fn softmax_f32(&self, x: &mut [f32]) {
+        #[cfg(target_os = "macos")]
+        if let Some(ref gpu) = self.gpu {
+            if gpu.should_dispatch(x.len()) {
+                gpu.softmax_f32(x);
+                return;
+            }
+        }
+        softmax_f32_fast(x);
+    }
+
+    /// GPU-accelerated flash attention: fused QK scoring + online softmax + V accumulation
+    /// Returns attention output [n_head × head_dim] computed entirely on GPU.
+    pub fn flash_attention_f32(
+        &self,
+        q_heads: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        seq_len: usize,
+        window_start: usize,
+        window_end: usize,
+    ) -> Option<Vec<f32>> {
+        #[cfg(target_os = "macos")]
+        if let Some(ref gpu) = self.gpu {
+            // Only dispatch to GPU if sequence length justifies the overhead
+            if seq_len >= 4 {
+                return Some(gpu.flash_attention_f32(
+                    q_heads,
+                    k_cache,
+                    v_cache,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    seq_len,
+                    window_start,
+                    window_end,
+                ));
+            }
+        }
+        let _ = (
+            q_heads,
+            k_cache,
+            v_cache,
+            n_head,
+            n_head_kv,
+            head_dim,
+            seq_len,
+            window_start,
+            window_end,
+        );
+        None
+    }
+
+    /// Whether GPU dispatch is active
+    pub fn has_gpu(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    /// Get path to compiled shader library
+    pub fn shader_library_path(&self) -> Option<&str> {
+        self.shader_lib.as_deref()
+    }
+
+    /// Fused QKV projection: compute Q, K, V in a single GPU dispatch.
+    /// Falls back to 3 separate CPU matvecs when GPU is unavailable or tensors are small.
+    /// Returns (Q, K, V) vectors.
+    pub fn fused_qkv_f32(
+        &self,
+        wq: &[f32],
+        wk: &[f32],
+        wv: &[f32],
+        x: &[f32],
+        q_dim: usize,
+        kv_dim: usize,
+        n_embd: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(gpu) = &self.gpu {
+                return gpu.fused_qkv_f32(wq, wk, wv, x, q_dim, kv_dim, n_embd);
+            }
+        }
+        // CPU fallback
+        fused_qkv_f32_cpu(wq, wk, wv, x, q_dim, kv_dim, n_embd)
+    }
+
+    /// Fused QKV projection + RoPE. Returns (Q_rope, K_rope, V).
+    /// GPU path computes projection and RoPE in a single dispatch.
+    /// CPU fallback does projection + separate RoPE application.
+    pub fn fused_qkv_rope_f32(
+        &self,
+        wq: &[f32],
+        wk: &[f32],
+        wv: &[f32],
+        x: &[f32],
+        q_dim: usize,
+        kv_dim: usize,
+        n_embd: usize,
+        head_dim: usize,
+        position: usize,
+        theta_base: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(gpu) = &self.gpu {
+                return gpu.fused_qkv_rope_f32(
+                    wq, wk, wv, x, q_dim, kv_dim, n_embd, head_dim, position, theta_base,
+                );
+            }
+        }
+        // CPU fallback
+        fused_qkv_rope_f32_cpu(
+            wq, wk, wv, x, q_dim, kv_dim, n_embd, head_dim, position, theta_base,
+        )
+    }
+
+    /// Fused post-attention residual add + FFN RMSNorm.
+    ///
+    /// Performs `hidden += attn_output` then returns `rmsnorm(hidden, weight)`.
+    /// GPU: two Metal dispatches. CPU: in-place add + norm + clone.
+    /// Eliminates the hidden_state clone and a separate RMSNorm call per layer.
+    pub fn fused_post_attn_norm_f32(
+        &self,
+        hidden: &mut [f32],
+        attn_output: &[f32],
+        norm_weight: &[f32],
+        eps: f32,
+    ) -> Vec<f32> {
+        #[cfg(target_os = "macos")]
+        if let Some(ref gpu) = self.gpu {
+            if gpu.should_dispatch(hidden.len()) {
+                return gpu.fused_post_attn_norm_f32(hidden, attn_output, norm_weight, eps);
+            }
+        }
+        // CPU fallback
+        fused_post_attn_norm_f32_cpu(hidden, attn_output, norm_weight, eps)
+    }
+
+    /// Fused RMSNorm + Output Projection: logits = W_out × rmsnorm(hidden_state)
+    /// GPU path computes inv_rms then fused norm+matmul in two back-to-back dispatches.
+    /// CPU fallback normalizes in-place then does standard matvec.
+    pub fn fused_rmsnorm_linear_f32(
+        &self,
+        x: &[f32],
+        norm_weight: &[f32],
+        out_weight: &[f32],
+        vocab_size: usize,
+        n_embd: usize,
+    ) -> Vec<f32> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(gpu) = &self.gpu {
+                if vocab_size * n_embd >= GPU_DISPATCH_THRESHOLD {
+                    return gpu.fused_rmsnorm_linear_f32(
+                        x,
+                        norm_weight,
+                        out_weight,
+                        vocab_size,
+                        n_embd,
+                    );
+                }
+            }
+        }
+        // CPU fallback
+        fused_rmsnorm_linear_f32_cpu(x, norm_weight, out_weight, vocab_size, n_embd)
+    }
+}
+
+/// SIMD-friendly matrix-vector multiply.
+/// v1.27: On aarch64, delegates to explicit NEON intrinsics for 2-4x speedup.
+/// On other architectures, uses 4-wide scalar accumulation.
+pub fn matvec_f32_simd(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::neon::matvec_f32_neon(w, x, out_dim, in_dim)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        matvec_f32_simd_scalar(w, x, out_dim, in_dim)
+    }
+}
+
+/// Scalar 4-wide accumulation fallback
+pub fn matvec_f32_simd_scalar(w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; out_dim];
+    let chunks = in_dim / 4;
+    let remainder = in_dim % 4;
+
+    for (i, y_val) in y.iter_mut().enumerate().take(out_dim) {
+        let row_start = i * in_dim;
+        if row_start + in_dim > w.len() {
+            continue;
+        }
+        let row = &w[row_start..row_start + in_dim];
+
+        let mut sum0 = 0.0f32;
+        let mut sum1 = 0.0f32;
+        let mut sum2 = 0.0f32;
+        let mut sum3 = 0.0f32;
+
+        for c in 0..chunks {
+            let j = c * 4;
+            sum0 += row[j] * x[j];
+            sum1 += row[j + 1] * x[j + 1];
+            sum2 += row[j + 2] * x[j + 2];
+            sum3 += row[j + 3] * x[j + 3];
+        }
+
+        let base = chunks * 4;
+        for j in 0..remainder {
+            sum0 += row[base + j] * x[base + j];
+        }
+
+        *y_val = sum0 + sum1 + sum2 + sum3;
+    }
+
+    y
+}
+
+/// Fast RMS normalization with fused multiply.
+/// v1.27: On aarch64, delegates to NEON intrinsics.
+pub fn rmsnorm_f32_fast(x: &mut [f32], weight: &[f32], eps: f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::neon::rmsnorm_f32_neon(x, weight, eps);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        rmsnorm_f32_fast_scalar(x, weight, eps);
+    }
+}
+
+/// Fused residual add + RMS normalization.
+/// Computes x[i] += residual[i], then RMSNorm(x, weight) in-place.
+/// Saves one memory pass vs separate add + rmsnorm.
+/// On GPU: single dispatch for add+sumsq, then normalize.
+/// On CPU: fused scalar loop.
+pub fn fused_residual_rmsnorm_f32(x: &mut [f32], residual: &[f32], weight: &[f32], eps: f32) {
+    debug_assert_eq!(x.len(), residual.len());
+    debug_assert_eq!(x.len(), weight.len());
+
+    // Fused scalar path: add residual and compute sum_sq in one pass
+    let n = x.len();
+    let mut sum_sq = 0.0f32;
+    for (i, xi) in x.iter_mut().enumerate() {
+        let val = *xi + residual.get(i).copied().unwrap_or(0.0);
+        *xi = val;
+        sum_sq += val * val;
+    }
+    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+    for (i, val) in x.iter_mut().enumerate() {
+        *val *= inv_rms * weight.get(i).copied().unwrap_or(1.0);
+    }
+}
+
+/// Fused QKV projection on CPU: compute Q, K, V from a single input vector.
+/// Equivalent to 3 separate matvec calls but expressed as a single function
+/// for symmetry with the GPU kernel.
+pub fn fused_qkv_f32_cpu(
+    wq: &[f32],
+    wk: &[f32],
+    wv: &[f32],
+    x: &[f32],
+    q_dim: usize,
+    kv_dim: usize,
+    n_embd: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let q = matvec_f32_simd(wq, x, q_dim, n_embd);
+    let k = matvec_f32_simd(wk, x, kv_dim, n_embd);
+    let v = matvec_f32_simd(wv, x, kv_dim, n_embd);
+    (q, k, v)
+}
+
+/// Apply RoPE in-place across multiple heads (CPU).
+/// Each head of `head_dim` elements gets rotary embeddings applied to dimension pairs.
+/// Apply RoPE in-place across multiple heads (CPU).
+/// Uses standard (non-NeoX) layout: pairs at (i, i + half_dim) within each head.
+/// This is the layout used by LLaMA, Qwen, and most GGUF models (GGML_ROPE_TYPE_NORM).
+pub fn rope_f32_multi_head(
+    x: &mut [f32],
+    head_dim: usize,
+    n_heads: usize,
+    position: usize,
+    theta_base: f32,
+) {
+    let half_dim = head_dim / 2;
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        for i in 0..half_dim {
+            let freq = 1.0 / theta_base.powf(2.0 * i as f32 / head_dim as f32);
+            let angle = position as f32 * freq;
+            let (sin_val, cos_val) = angle.sin_cos();
+            let idx0 = base + i;
+            let idx1 = base + i + half_dim;
+            if idx1 < x.len() {
+                let x0 = x[idx0];
+                let x1 = x[idx1];
+                x[idx0] = x0 * cos_val - x1 * sin_val;
+                x[idx1] = x0 * sin_val + x1 * cos_val;
+            }
+        }
+    }
+}
+
+/// Fused QKV projection + RoPE on CPU: compute Q, K, V and apply RoPE to Q and K.
+pub fn fused_qkv_rope_f32_cpu(
+    wq: &[f32],
+    wk: &[f32],
+    wv: &[f32],
+    x: &[f32],
+    q_dim: usize,
+    kv_dim: usize,
+    n_embd: usize,
+    head_dim: usize,
+    position: usize,
+    theta_base: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut q = matvec_f32_simd(wq, x, q_dim, n_embd);
+    let mut k = matvec_f32_simd(wk, x, kv_dim, n_embd);
+    let v = matvec_f32_simd(wv, x, kv_dim, n_embd);
+    let n_head_q = q_dim / head_dim;
+    let n_head_kv = kv_dim / head_dim;
+    rope_f32_multi_head(&mut q, head_dim, n_head_q, position, theta_base);
+    rope_f32_multi_head(&mut k, head_dim, n_head_kv, position, theta_base);
+    (q, k, v)
+}
+
+/// CPU fallback for fused RMSNorm + output projection.
+/// Normalizes hidden state, then computes logits via matvec.
+/// CPU fallback for fused post-attention residual add + FFN RMSNorm.
+///
+/// Performs: hidden[i] += attn[i], then returns rmsnorm(hidden) * weight.
+pub fn fused_post_attn_norm_f32_cpu(
+    hidden: &mut [f32],
+    attn_output: &[f32],
+    norm_weight: &[f32],
+    eps: f32,
+) -> Vec<f32> {
+    let n = hidden.len();
+    // Residual add
+    for i in 0..n {
+        hidden[i] += attn_output[i];
+    }
+    // RMSNorm → output
+    let sum_sq: f32 = hidden.iter().map(|x| x * x).sum();
+    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+    hidden
+        .iter()
+        .zip(norm_weight.iter())
+        .map(|(&h, &w)| h * inv_rms * w)
+        .collect()
+}
+
+pub fn fused_rmsnorm_linear_f32_cpu(
+    x: &[f32],
+    norm_weight: &[f32],
+    out_weight: &[f32],
+    vocab_size: usize,
+    n_embd: usize,
+) -> Vec<f32> {
+    fused_rmsnorm_linear_f32_cpu_eps(x, norm_weight, out_weight, vocab_size, n_embd, 1e-5)
+}
+
+pub fn fused_rmsnorm_linear_f32_cpu_eps(
+    x: &[f32],
+    norm_weight: &[f32],
+    out_weight: &[f32],
+    vocab_size: usize,
+    n_embd: usize,
+    eps: f32,
+) -> Vec<f32> {
+    // Compute inv_rms
+    let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / (sum_sq / n_embd as f32 + eps).sqrt();
+
+    // Build normalized hidden state: x_norm[i] = x[i] * inv_rms * norm_weight[i]
+    let x_norm: Vec<f32> = x
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v * inv_rms * norm_weight.get(i).copied().unwrap_or(1.0))
+        .collect();
+
+    // Project to logits
+    matvec_f32_simd(out_weight, &x_norm, vocab_size, n_embd)
+}
+
+/// Fused RMSNorm + quantized linear projection (no f32 weight allocation).
+/// Normalizes `x` in-place, then computes logits via quantized matvec on raw bytes.
+pub fn fused_rmsnorm_linear_quantized_cpu(
+    x: &[f32],
+    norm_weight: &[f32],
+    out_raw: &[u8],
+    out_dtype: GgmlType,
+    vocab_size: usize,
+    n_embd: usize,
+) -> Vec<f32> {
+    fused_rmsnorm_linear_quantized_cpu_eps(x, norm_weight, out_raw, out_dtype, vocab_size, n_embd, 1e-5)
+}
+
+pub fn fused_rmsnorm_linear_quantized_cpu_eps(
+    x: &[f32],
+    norm_weight: &[f32],
+    out_raw: &[u8],
+    out_dtype: GgmlType,
+    vocab_size: usize,
+    n_embd: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / (sum_sq / n_embd as f32 + eps).sqrt();
+
+    let x_norm: Vec<f32> = x
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v * inv_rms * norm_weight.get(i).copied().unwrap_or(1.0))
+        .collect();
+
+    matvec_quantized_cpu(out_raw, &x_norm, vocab_size, n_embd, out_dtype)
+}
+
+/// Scalar RMS normalization fallback
+pub fn rmsnorm_f32_fast_scalar(x: &mut [f32], weight: &[f32], eps: f32) {
+    let n = x.len();
+    let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+
+    for (i, val) in x.iter_mut().enumerate() {
+        *val *= inv_rms * weight.get(i).copied().unwrap_or(1.0);
+    }
+}
+
+/// Numerically stable softmax.
+/// v1.27: On aarch64, delegates to NEON intrinsics.
+pub fn softmax_f32_fast(x: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::neon::softmax_f32_neon(x);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        softmax_f32_fast_scalar(x);
+    }
+}
+
+/// Scalar softmax fallback
+pub fn softmax_f32_fast_scalar(x: &mut [f32]) {
+    if x.is_empty() {
+        return;
+    }
+    let max_val = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() {
+        *v = (*v - max_val).exp();
+        sum += *v;
+    }
+    if sum > 0.0 {
+        let inv_sum = 1.0 / sum;
+        for v in x.iter_mut() {
+            *v *= inv_sum;
+        }
+    }
+}
+
+/// Apply RoPE (Rotary Position Embedding) in-place
+pub fn rope_f32_fast(x: &mut [f32], head_dim: usize, position: usize, theta_base: f32) {
+    let half_dim = head_dim / 2;
+    for i in 0..half_dim {
+        let freq = 1.0 / theta_base.powf(2.0 * i as f32 / head_dim as f32);
+        let angle = position as f32 * freq;
+        let (sin_val, cos_val) = angle.sin_cos();
+        let idx0 = i * 2;
+        let idx1 = idx0 + 1;
+        if idx1 < x.len() {
+            let x0 = x[idx0];
+            let x1 = x[idx1];
+            x[idx0] = x0 * cos_val - x1 * sin_val;
+            x[idx1] = x0 * sin_val + x1 * cos_val;
+        }
+    }
+}
+
+/// SiLU activation: x * sigmoid(x)
+pub fn silu_f32(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = *v / (1.0 + (-*v).exp());
+    }
+}
+
+/// CPU quantized matvec dispatch by type
+pub fn matvec_quantized_cpu(
+    w_raw: &[u8],
+    x: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+    dtype: GgmlType,
+) -> Vec<f32> {
+    match dtype {
+        GgmlType::Q4_0 => matvec_q4_0_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::Q3K => matvec_q3_k_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::Q4K => matvec_q4_k_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::Q5K => matvec_q5_k_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::Q6K => matvec_q6_k_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::Q8_0 => matvec_q8_0_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::Q2K => matvec_q2_k_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::Q8K => matvec_q8_k_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::IQ4NL => matvec_iq4_nl_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::IQ4XS => matvec_iq4_xs_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::IQ3XXS => matvec_iq3_xxs_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::IQ3S => matvec_iq3_s_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::IQ2XXS => matvec_iq2_xxs_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::IQ2XS => matvec_iq2_xs_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::BF16 => matvec_bf16_cpu(w_raw, x, out_dim, in_dim),
+        GgmlType::F16 => matvec_f16_cpu(w_raw, x, out_dim, in_dim),
+        _ => {
+            debug!("Unsupported quant type {:?}, returning zeros", dtype);
+            vec![0.0; out_dim]
+        }
+    }
+}
+
+/// CPU Q4_0 dequant matvec
+fn matvec_q4_0_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 32usize;
+    let block_bytes = 18usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let scale = f16_to_f32(w[boff], w[boff + 1]);
+            let x_base = b * block_size;
+            for j in 0..16 {
+                let byte = w[boff + 2 + j];
+                let lo = (byte & 0x0F) as i32 - 8;
+                let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                sum += scale * lo as f32 * x[x_base + j * 2];
+                sum += scale * hi as f32 * x[x_base + j * 2 + 1];
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU Q4_K dequant matvec
+fn matvec_q4_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let block_bytes = 144usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let d = f16_to_f32(w[boff], w[boff + 1]);
+            let dmin = f16_to_f32(w[boff + 2], w[boff + 3]);
+            let sc = &w[boff + 4..boff + 16];
+            let qs = &w[boff + 16..boff + 144];
+            let x_base = b * block_size;
+
+            // Canonical Q4K: sub-block sb fills output position [sb*32 .. sb*32+32].
+            // Each sub-block reads 32 bytes from qs[(sb/2)*32 ..], using low nibbles
+            // when sb is even and high nibbles when sb is odd.
+            // Canonical llama.cpp get_scale_min_k4:
+            //   if j<4: d = sc[j] & 0x3F ; m = sc[j+4] & 0x3F
+            //   else:   d = (sc[j+4] & 0xF) | ((sc[j-4] >> 6) << 4)
+            //           m = (sc[j+4] >> 4) | ((sc[j]   >> 6) << 4)
+            for sb in 0..8u8 {
+                let (sc_low, m_low) = if sb < 4 {
+                    (sc[sb as usize] & 0x3F, sc[sb as usize + 4] & 0x3F)
+                } else {
+                    let si4 = (sb - 4) as usize;
+                    (
+                        (sc[sb as usize + 4] & 0x0F) | ((sc[si4] >> 6) << 4),
+                        (sc[sb as usize + 4] >> 4)   | ((sc[sb as usize] >> 6) << 4),
+                    )
+                };
+                let scale = d * sc_low as f32;
+                let min_val = dmin * m_low as f32;
+
+                let byte_chunk = (sb / 2) as usize;
+                let half_high = (sb % 2) == 1;
+                let qs_off = byte_chunk * 32;
+                let x_off = x_base + sb as usize * 32;
+                for l in 0..32usize {
+                    let byte_val = qs[qs_off + l];
+                    let nibble = if half_high { byte_val >> 4 } else { byte_val & 0x0F };
+                    let v = scale * nibble as f32 - min_val;
+                    sum += v * x[x_off + l];
+                }
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU Q6_K dequant matvec
+/// CPU Q6_K dequant matvec — stride-32 interleaved layout matching llama.cpp
+fn matvec_q6_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let block_bytes = 210usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let ql = &w[boff..boff + 128];
+            let qh = &w[boff + 128..boff + 192];
+            let scales = &w[boff + 192..boff + 208];
+            let d = f16_to_f32(w[boff + 208], w[boff + 209]);
+            let x_base = b * block_size;
+
+            // Two halves of 128 elements each
+            let mut ql_off = 0usize;
+            let mut qh_off = 0usize;
+            let mut sc_off = 0usize;
+            let mut x_off = 0usize;
+
+            for _ in 0..2u32 {
+                for l in 0..32usize {
+                    let is = l / 16;
+                    let q1 = ((ql[ql_off + l] & 0x0F) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                    let q2 = ((ql[ql_off + l + 32] & 0x0F) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                    let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                    let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+
+                    let s0 = d * scales[sc_off + is] as i8 as f32;
+                    let s2 = d * scales[sc_off + is + 2] as i8 as f32;
+                    let s4 = d * scales[sc_off + is + 4] as i8 as f32;
+                    let s6 = d * scales[sc_off + is + 6] as i8 as f32;
+
+                    sum += s0 * q1 as f32 * x[x_base + x_off + l];
+                    sum += s2 * q2 as f32 * x[x_base + x_off + l + 32];
+                    sum += s4 * q3 as f32 * x[x_base + x_off + l + 64];
+                    sum += s6 * q4 as f32 * x[x_base + x_off + l + 96];
+                }
+                ql_off += 64;
+                qh_off += 32;
+                sc_off += 8;
+                x_off += 128;
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU Q3_K dequant matvec
+/// Block layout (256 elements, 110 bytes):
+///   32B hmask (high bit) + 64B qs (low 2 bits, 4 per byte) + 12B scales + 2B f16 d
+fn matvec_q3_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let block_bytes = 110usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let hmask = &w[boff..boff + 32];
+            let qs = &w[boff + 32..boff + 96];
+            let sc = &w[boff + 96..boff + 108];
+            let d = f16_to_f32(w[boff + 108], w[boff + 109]);
+            let x_base = b * block_size;
+
+            for sb in 0..16usize {
+                // Extract 6-bit signed scale
+                let low4 = (sc[sb / 2] >> ((sb & 1) * 4)) & 0x0F;
+                let hi2 = (sc[8 + sb / 4] >> ((sb % 4) * 2)) & 0x03;
+                let mut scale_val = (low4 | (hi2 << 4)) as i32;
+                if scale_val >= 32 {
+                    scale_val -= 64;
+                }
+                let sc_f = d * scale_val as f32;
+
+                for j in 0..16usize {
+                    let idx = sb * 16 + j;
+                    // Low 2 bits from qs (4 per byte)
+                    let qs_byte = qs[idx / 4];
+                    let shift = (idx % 4) * 2;
+                    let low2 = (qs_byte >> shift) & 0x03;
+                    // High bit from hmask
+                    let hbit = (hmask[idx / 8] >> (idx % 8)) & 1;
+                    // 3-bit value centered at 4
+                    let q = (low2 | (hbit << 2)) as i32 - 4;
+                    sum += sc_f * q as f32 * x[x_base + idx];
+                }
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU Q5_K dequant matvec
+/// Block layout (256 elements, 176 bytes):
+///   f16 d (2B) + f16 dmin (2B) + 12B scales + 32B qh (high bit) + 128B ql (nibbles)
+fn matvec_q5_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let block_bytes = 176usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let d = f16_to_f32(w[boff], w[boff + 1]);
+            let dmin = f16_to_f32(w[boff + 2], w[boff + 3]);
+            let sc = &w[boff + 4..boff + 16];
+            let qh = &w[boff + 16..boff + 48];
+            let ql = &w[boff + 48..boff + 176];
+            let x_base = b * block_size;
+
+            for sb in 0..8u8 {
+                // Extract 6-bit scale and min (same packing as Q4_K)
+                let (sc_low, m_low) = if sb < 4 {
+                    (sc[sb as usize] & 0x3F, sc[sb as usize + 4] & 0x3F)
+                } else {
+                    let si = (sb - 4) as usize;
+                    (
+                        (sc[si] >> 6) | ((sc[sb as usize + 4] & 0x0F) << 2),
+                        (sc[sb as usize] >> 6) | ((sc[sb as usize + 4] >> 4) << 2),
+                    )
+                };
+                let scale = d * sc_low as f32;
+                let min_val = dmin * m_low as f32;
+
+                let qs_off = sb as usize * 16;
+                for j in 0..16usize {
+                    let idx0 = sb as usize * 32 + j * 2;
+                    let idx1 = idx0 + 1;
+
+                    let byte_val = ql[qs_off + j];
+                    let low0 = byte_val & 0x0F;
+                    let low1 = (byte_val >> 4) & 0x0F;
+
+                    // High bit from qh
+                    let hbit0 = (qh[idx0 / 8] >> (idx0 % 8)) & 1;
+                    let hbit1 = (qh[idx1 / 8] >> (idx1 % 8)) & 1;
+
+                    // 5-bit value
+                    let v0 = scale * (low0 | (hbit0 << 4)) as f32 - min_val;
+                    let v1 = scale * (low1 | (hbit1 << 4)) as f32 - min_val;
+
+                    sum += v0 * x[x_base + idx0] + v1 * x[x_base + idx1];
+                }
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU Q8_0 dequant matvec
+fn matvec_q8_0_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 32usize;
+    let block_bytes = 34usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let scale = f16_to_f32(w[boff], w[boff + 1]);
+            let x_base = b * block_size;
+            for j in 0..32 {
+                let val = w[boff + 2 + j] as i8;
+                sum += scale * val as f32 * x[x_base + j];
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU Q2_K dequant matvec
+/// Block layout (256 elements, 84 bytes):
+///   f16 d (2B) + f16 dmin (2B) + 16B scales/mins (4-bit packed) + 64B qs (2-bit quants)
+fn matvec_q2_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let block_bytes = 84usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let d = f16_to_f32(w[boff], w[boff + 1]);
+            let dmin = f16_to_f32(w[boff + 2], w[boff + 3]);
+            let sc = &w[boff + 4..boff + 20]; // 16 bytes: scales and mins
+            let qs = &w[boff + 20..boff + 84]; // 64 bytes: 2-bit quants (4 per byte)
+            let x_base = b * block_size;
+
+            // 16 sub-blocks of 16 elements each
+            for (sb, &sc_byte) in sc.iter().enumerate() {
+                // Each scale byte packs: low 4 bits = scale, high 4 bits = min
+                let scale = d * (sc_byte & 0x0F) as f32;
+                let min_val = dmin * ((sc_byte >> 4) & 0x0F) as f32;
+
+                for j in 0..16usize {
+                    let idx = sb * 16 + j;
+                    // 2-bit quant, 4 per byte
+                    let qs_byte = qs[idx / 4];
+                    let shift = (idx % 4) * 2;
+                    let q = ((qs_byte >> shift) & 0x03) as f32;
+                    sum += (scale * q - min_val) * x[x_base + idx];
+                }
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU Q8_K dequant matvec
+/// Block layout (256 elements, 292 bytes):
+///   f32 d (4B) + 256B qs (int8) + 32B bsums (16 × int16, unused for matvec)
+fn matvec_q8_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let block_bytes = 292usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            // f32 scale (little-endian)
+            let d = f32::from_le_bytes([w[boff], w[boff + 1], w[boff + 2], w[boff + 3]]);
+            let x_base = b * block_size;
+            for j in 0..256 {
+                let val = w[boff + 4 + j] as i8;
+                sum += d * val as f32 * x[x_base + j];
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// IQ4_NL non-linear lookup table (from llama.cpp ggml-quants.c)
+/// Maps 4-bit indices (0..15) to non-linearly spaced dequantized values.
+const IQ4_NL_QUANTS: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+/// CPU IQ4_NL dequant matvec
+/// Block layout (32 elements, 18 bytes):
+///   f16 d (2B) + 16B qs (4-bit indices into IQ4_NL_QUANTS)
+fn matvec_iq4_nl_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 32usize;
+    let block_bytes = 18usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let d = f16_to_f32(w[boff], w[boff + 1]);
+            let x_base = b * block_size;
+            for j in 0..16 {
+                let byte = w[boff + 2 + j];
+                let lo = (byte & 0x0F) as usize;
+                let hi = ((byte >> 4) & 0x0F) as usize;
+                sum += d * IQ4_NL_QUANTS[lo] as f32 * x[x_base + 2 * j];
+                sum += d * IQ4_NL_QUANTS[hi] as f32 * x[x_base + 2 * j + 1];
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU IQ4_XS dequant matvec
+/// Block layout (256 elements, 148 bytes):
+///   f16 d (2B) + u16 scales_h (2B) + 8×u16 scales_l (16B) + 128B qs
+/// Each sub-block of 32 elements has a 6-bit scale (low 4 bits from scales_l, high 2 bits from scales_h).
+fn matvec_iq4_xs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let block_bytes = 148usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let d = f16_to_f32(w[boff], w[boff + 1]);
+            let scales_h = u16::from_le_bytes([w[boff + 2], w[boff + 3]]);
+
+            // 8 sub-blocks of 32 elements each
+            for sb in 0..8 {
+                // Low 4 bits of scale from scales_l (packed as nibbles in u16s)
+                let sl_idx = sb / 2;
+                let sl_word =
+                    u16::from_le_bytes([w[boff + 4 + sl_idx * 2], w[boff + 5 + sl_idx * 2]]);
+                let sl = if sb % 2 == 0 {
+                    (sl_word & 0x0F) as i32
+                } else {
+                    ((sl_word >> 4) & 0x0F) as i32
+                };
+                // High 2 bits from scales_h
+                let sh = ((scales_h >> (2 * sb)) & 0x03) as i32;
+                let scale = (sl | (sh << 4)) as f32 - 32.0;
+
+                let qs_off = boff + 20 + sb * 16; // 20 = 2 + 2 + 16 header
+                let x_base = b * block_size + sb * 32;
+                for j in 0..16 {
+                    let byte = w[qs_off + j];
+                    let lo = (byte & 0x0F) as usize;
+                    let hi = ((byte >> 4) & 0x0F) as usize;
+                    sum += d * scale * IQ4_NL_QUANTS[lo] as f32 * x[x_base + 2 * j];
+                    sum += d * scale * IQ4_NL_QUANTS[hi] as f32 * x[x_base + 2 * j + 1];
+                }
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// IQ2_XXS grid lookup table (256 entries of uint64, from llama.cpp ggml-common.h)
+/// Each entry encodes 8 weight values (one byte each). Values are {0x08, 0x19, 0x2b}.
+const IQ2XXS_GRID: [u64; 256] = [
+    0x0808080808080808,
+    0x080808080808082b,
+    0x0808080808081919,
+    0x0808080808082b08,
+    0x0808080808082b2b,
+    0x0808080808190819,
+    0x0808080808191908,
+    0x08080808082b0808,
+    0x08080808082b082b,
+    0x08080808082b2b08,
+    0x08080808082b2b2b,
+    0x0808080819080819,
+    0x0808080819081908,
+    0x0808080819190808,
+    0x0808080819192b08,
+    0x08080808192b0819,
+    0x08080808192b1908,
+    0x080808082b080808,
+    0x080808082b08082b,
+    0x080808082b082b2b,
+    0x080808082b2b082b,
+    0x0808081908080819,
+    0x0808081908081908,
+    0x0808081908190808,
+    0x0808081908191919,
+    0x0808081919080808,
+    0x080808192b081908,
+    0x080808192b192b08,
+    0x0808082b08080808,
+    0x0808082b0808082b,
+    0x0808082b082b082b,
+    0x0808082b2b08082b,
+    0x0808190808080819,
+    0x0808190808081908,
+    0x0808190808190808,
+    0x08081908082b0819,
+    0x08081908082b1908,
+    0x0808190819080808,
+    0x080819081908082b,
+    0x0808190819082b08,
+    0x08081908192b0808,
+    0x080819082b080819,
+    0x080819082b081908,
+    0x080819082b190808,
+    0x080819082b2b1908,
+    0x0808191908080808,
+    0x080819190808082b,
+    0x0808191908082b08,
+    0x08081919082b0808,
+    0x080819191908192b,
+    0x08081919192b2b19,
+    0x080819192b080808,
+    0x080819192b190819,
+    0x0808192b08082b19,
+    0x0808192b08190808,
+    0x0808192b19080808,
+    0x0808192b2b081908,
+    0x0808192b2b2b1908,
+    0x08082b0808080808,
+    0x08082b0808081919,
+    0x08082b0808082b08,
+    0x08082b0808191908,
+    0x08082b08082b2b08,
+    0x08082b0819080819,
+    0x08082b0819081908,
+    0x08082b0819190808,
+    0x08082b081919082b,
+    0x08082b082b082b08,
+    0x08082b1908081908,
+    0x08082b1919080808,
+    0x08082b2b0808082b,
+    0x08082b2b08191908,
+    0x0819080808080819,
+    0x0819080808081908,
+    0x0819080808190808,
+    0x08190808082b0819,
+    0x0819080819080808,
+    0x08190808192b0808,
+    0x081908082b081908,
+    0x081908082b190808,
+    0x081908082b191919,
+    0x0819081908080808,
+    0x0819081908082b08,
+    0x08190819082b0808,
+    0x0819081919190808,
+    0x0819081919192b2b,
+    0x081908192b080808,
+    0x0819082b082b1908,
+    0x0819082b19081919,
+    0x0819190808080808,
+    0x0819190808082b08,
+    0x08191908082b0808,
+    0x08191908082b1919,
+    0x0819190819082b19,
+    0x081919082b080808,
+    0x0819191908192b08,
+    0x08191919192b082b,
+    0x0819192b08080808,
+    0x0819192b0819192b,
+    0x08192b0808080819,
+    0x08192b0808081908,
+    0x08192b0808190808,
+    0x08192b0819080808,
+    0x08192b082b080819,
+    0x08192b1908080808,
+    0x08192b1908081919,
+    0x08192b192b2b0808,
+    0x08192b2b19190819,
+    0x082b080808080808,
+    0x082b08080808082b,
+    0x082b080808082b2b,
+    0x082b080819081908,
+    0x082b0808192b0819,
+    0x082b08082b080808,
+    0x082b08082b08082b,
+    0x082b0819082b2b19,
+    0x082b081919082b08,
+    0x082b082b08080808,
+    0x082b082b0808082b,
+    0x082b190808080819,
+    0x082b190808081908,
+    0x082b190808190808,
+    0x082b190819080808,
+    0x082b19081919192b,
+    0x082b191908080808,
+    0x082b191919080819,
+    0x082b1919192b1908,
+    0x082b192b2b190808,
+    0x082b2b0808082b08,
+    0x082b2b08082b0808,
+    0x082b2b082b191908,
+    0x082b2b2b19081908,
+    0x1908080808080819,
+    0x1908080808081908,
+    0x1908080808190808,
+    0x1908080808192b08,
+    0x19080808082b0819,
+    0x19080808082b1908,
+    0x1908080819080808,
+    0x1908080819082b08,
+    0x190808081919192b,
+    0x19080808192b0808,
+    0x190808082b080819,
+    0x190808082b081908,
+    0x190808082b190808,
+    0x1908081908080808,
+    0x19080819082b0808,
+    0x19080819192b0819,
+    0x190808192b080808,
+    0x190808192b081919,
+    0x1908082b08080819,
+    0x1908082b08190808,
+    0x1908082b19082b08,
+    0x1908082b1919192b,
+    0x1908082b192b2b08,
+    0x1908190808080808,
+    0x1908190808082b08,
+    0x19081908082b0808,
+    0x190819082b080808,
+    0x190819082b192b19,
+    0x190819190819082b,
+    0x19081919082b1908,
+    0x1908192b08080808,
+    0x19082b0808080819,
+    0x19082b0808081908,
+    0x19082b0808190808,
+    0x19082b0819080808,
+    0x19082b0819081919,
+    0x19082b1908080808,
+    0x19082b1919192b08,
+    0x19082b19192b0819,
+    0x19082b192b08082b,
+    0x19082b2b19081919,
+    0x19082b2b2b190808,
+    0x1919080808080808,
+    0x1919080808082b08,
+    0x1919080808190819,
+    0x1919080808192b19,
+    0x19190808082b0808,
+    0x191908082b080808,
+    0x191908082b082b08,
+    0x1919081908081908,
+    0x191908191908082b,
+    0x191908192b2b1908,
+    0x1919082b2b190819,
+    0x191919082b190808,
+    0x191919082b19082b,
+    0x1919191908082b2b,
+    0x1919192b08080819,
+    0x1919192b19191908,
+    0x19192b0808080808,
+    0x19192b0808190819,
+    0x19192b0808192b19,
+    0x19192b08192b1908,
+    0x19192b1919080808,
+    0x19192b2b08082b08,
+    0x192b080808081908,
+    0x192b080808190808,
+    0x192b080819080808,
+    0x192b0808192b2b08,
+    0x192b081908080808,
+    0x192b081919191919,
+    0x192b082b08192b08,
+    0x192b082b192b0808,
+    0x192b190808080808,
+    0x192b190808081919,
+    0x192b191908190808,
+    0x192b19190819082b,
+    0x192b19192b081908,
+    0x192b2b081908082b,
+    0x2b08080808080808,
+    0x2b0808080808082b,
+    0x2b08080808082b2b,
+    0x2b08080819080819,
+    0x2b0808082b08082b,
+    0x2b08081908081908,
+    0x2b08081908192b08,
+    0x2b08081919080808,
+    0x2b08082b08190819,
+    0x2b08190808080819,
+    0x2b08190808081908,
+    0x2b08190808190808,
+    0x2b08190808191919,
+    0x2b08190819080808,
+    0x2b081908192b0808,
+    0x2b08191908080808,
+    0x2b0819191908192b,
+    0x2b0819192b191908,
+    0x2b08192b08082b19,
+    0x2b08192b19080808,
+    0x2b08192b192b0808,
+    0x2b082b080808082b,
+    0x2b082b1908081908,
+    0x2b082b2b08190819,
+    0x2b19080808081908,
+    0x2b19080808190808,
+    0x2b190808082b1908,
+    0x2b19080819080808,
+    0x2b1908082b2b0819,
+    0x2b1908190819192b,
+    0x2b1908192b080808,
+    0x2b19082b19081919,
+    0x2b19190808080808,
+    0x2b191908082b082b,
+    0x2b19190819081908,
+    0x2b19191919190819,
+    0x2b192b082b080819,
+    0x2b192b19082b0808,
+    0x2b2b08080808082b,
+    0x2b2b080819190808,
+    0x2b2b08082b081919,
+    0x2b2b081908082b19,
+    0x2b2b082b08080808,
+    0x2b2b190808192b08,
+    0x2b2b2b0819190808,
+    0x2b2b2b1908081908,
+];
+
+/// IQ2_XS grid lookup table (512 entries of uint64, from llama.cpp ggml-common.h)
+/// Each entry encodes 8 weight values. Values are {0x08, 0x19, 0x2b}.
+const IQ2XS_GRID: [u64; 512] = [
+    0x0808080808080808,
+    0x080808080808082b,
+    0x0808080808081919,
+    0x0808080808082b08,
+    0x0808080808082b2b,
+    0x0808080808190819,
+    0x0808080808191908,
+    0x080808080819192b,
+    0x0808080808192b19,
+    0x08080808082b0808,
+    0x08080808082b082b,
+    0x08080808082b1919,
+    0x08080808082b2b08,
+    0x0808080819080819,
+    0x0808080819081908,
+    0x080808081908192b,
+    0x0808080819082b19,
+    0x0808080819190808,
+    0x080808081919082b,
+    0x0808080819191919,
+    0x0808080819192b08,
+    0x08080808192b0819,
+    0x08080808192b1908,
+    0x080808082b080808,
+    0x080808082b08082b,
+    0x080808082b081919,
+    0x080808082b082b08,
+    0x080808082b190819,
+    0x080808082b191908,
+    0x080808082b192b19,
+    0x080808082b2b0808,
+    0x0808081908080819,
+    0x0808081908081908,
+    0x080808190808192b,
+    0x0808081908082b19,
+    0x0808081908190808,
+    0x080808190819082b,
+    0x0808081908191919,
+    0x0808081908192b08,
+    0x0808081908192b2b,
+    0x08080819082b0819,
+    0x08080819082b1908,
+    0x0808081919080808,
+    0x080808191908082b,
+    0x0808081919081919,
+    0x0808081919082b08,
+    0x0808081919190819,
+    0x0808081919191908,
+    0x08080819192b0808,
+    0x08080819192b2b08,
+    0x080808192b080819,
+    0x080808192b081908,
+    0x080808192b190808,
+    0x0808082b08080808,
+    0x0808082b0808082b,
+    0x0808082b08081919,
+    0x0808082b08082b08,
+    0x0808082b08190819,
+    0x0808082b08191908,
+    0x0808082b082b0808,
+    0x0808082b19080819,
+    0x0808082b19081908,
+    0x0808082b19190808,
+    0x0808082b19191919,
+    0x0808082b2b080808,
+    0x0808082b2b082b2b,
+    0x0808190808080819,
+    0x0808190808081908,
+    0x080819080808192b,
+    0x0808190808082b19,
+    0x0808190808190808,
+    0x080819080819082b,
+    0x0808190808191919,
+    0x0808190808192b08,
+    0x08081908082b0819,
+    0x08081908082b1908,
+    0x0808190819080808,
+    0x080819081908082b,
+    0x0808190819081919,
+    0x0808190819082b08,
+    0x0808190819190819,
+    0x0808190819191908,
+    0x080819081919192b,
+    0x08081908192b0808,
+    0x080819082b080819,
+    0x080819082b081908,
+    0x080819082b190808,
+    0x0808191908080808,
+    0x080819190808082b,
+    0x0808191908081919,
+    0x0808191908082b08,
+    0x0808191908190819,
+    0x0808191908191908,
+    0x08081919082b0808,
+    0x0808191919080819,
+    0x0808191919081908,
+    0x0808191919190808,
+    0x08081919192b0819,
+    0x080819192b080808,
+    0x0808192b08080819,
+    0x0808192b08081908,
+    0x0808192b08190808,
+    0x0808192b082b192b,
+    0x0808192b19080808,
+    0x0808192b1908082b,
+    0x0808192b2b081908,
+    0x08082b0808080808,
+    0x08082b080808082b,
+    0x08082b0808081919,
+    0x08082b0808082b08,
+    0x08082b0808082b2b,
+    0x08082b0808190819,
+    0x08082b0808191908,
+    0x08082b08082b0808,
+    0x08082b08082b1919,
+    0x08082b0819080819,
+    0x08082b0819081908,
+    0x08082b0819190808,
+    0x08082b0819192b08,
+    0x08082b082b080808,
+    0x08082b082b2b0808,
+    0x08082b082b2b2b2b,
+    0x08082b1908080819,
+    0x08082b1908081908,
+    0x08082b1908190808,
+    0x08082b1919080808,
+    0x08082b192b080819,
+    0x08082b192b082b19,
+    0x08082b2b08080808,
+    0x08082b2b082b0808,
+    0x08082b2b082b2b08,
+    0x08082b2b2b19192b,
+    0x08082b2b2b2b0808,
+    0x0819080808080819,
+    0x0819080808081908,
+    0x081908080808192b,
+    0x0819080808082b19,
+    0x0819080808190808,
+    0x081908080819082b,
+    0x0819080808191919,
+    0x0819080808192b08,
+    0x08190808082b0819,
+    0x08190808082b1908,
+    0x0819080819080808,
+    0x081908081908082b,
+    0x0819080819081919,
+    0x0819080819082b08,
+    0x0819080819190819,
+    0x0819080819191908,
+    0x08190808192b0808,
+    0x08190808192b2b2b,
+    0x081908082b080819,
+    0x081908082b081908,
+    0x081908082b190808,
+    0x0819081908080808,
+    0x081908190808082b,
+    0x0819081908081919,
+    0x0819081908082b08,
+    0x0819081908190819,
+    0x0819081908191908,
+    0x08190819082b0808,
+    0x0819081919080819,
+    0x0819081919081908,
+    0x0819081919190808,
+    0x081908192b080808,
+    0x081908192b191908,
+    0x081908192b19192b,
+    0x0819082b08080819,
+    0x0819082b08081908,
+    0x0819082b0808192b,
+    0x0819082b08190808,
+    0x0819082b19080808,
+    0x0819082b192b0808,
+    0x0819190808080808,
+    0x081919080808082b,
+    0x0819190808081919,
+    0x0819190808082b08,
+    0x0819190808190819,
+    0x0819190808191908,
+    0x08191908082b0808,
+    0x0819190819080819,
+    0x0819190819081908,
+    0x0819190819082b19,
+    0x0819190819190808,
+    0x08191908192b1908,
+    0x081919082b080808,
+    0x0819191908080819,
+    0x0819191908081908,
+    0x0819191908190808,
+    0x0819191919080808,
+    0x0819192b08080808,
+    0x0819192b08191908,
+    0x0819192b19082b19,
+    0x08192b0808080819,
+    0x08192b0808081908,
+    0x08192b0808190808,
+    0x08192b080819082b,
+    0x08192b0819080808,
+    0x08192b0819191908,
+    0x08192b082b08192b,
+    0x08192b1908080808,
+    0x08192b1908081919,
+    0x08192b19192b192b,
+    0x08192b2b19190819,
+    0x08192b2b2b2b2b19,
+    0x082b080808080808,
+    0x082b08080808082b,
+    0x082b080808081919,
+    0x082b080808082b08,
+    0x082b080808082b2b,
+    0x082b080808190819,
+    0x082b080808191908,
+    0x082b0808082b0808,
+    0x082b080819080819,
+    0x082b080819081908,
+    0x082b080819190808,
+    0x082b08082b080808,
+    0x082b08082b2b0808,
+    0x082b081908080819,
+    0x082b081908081908,
+    0x082b081908190808,
+    0x082b081919080808,
+    0x082b081919082b08,
+    0x082b0819192b1919,
+    0x082b082b08080808,
+    0x082b082b082b082b,
+    0x082b082b2b080808,
+    0x082b082b2b2b2b08,
+    0x082b190808080819,
+    0x082b190808081908,
+    0x082b190808190808,
+    0x082b1908082b2b19,
+    0x082b190819080808,
+    0x082b191908080808,
+    0x082b191919080819,
+    0x082b19191919082b,
+    0x082b19192b192b19,
+    0x082b192b08080819,
+    0x082b192b08192b2b,
+    0x082b192b2b2b192b,
+    0x082b2b0808080808,
+    0x082b2b0808082b08,
+    0x082b2b0808082b2b,
+    0x082b2b08082b0808,
+    0x082b2b0819191919,
+    0x082b2b082b082b08,
+    0x082b2b082b2b082b,
+    0x082b2b19192b2b08,
+    0x082b2b192b190808,
+    0x082b2b2b08082b08,
+    0x082b2b2b082b0808,
+    0x082b2b2b2b08082b,
+    0x082b2b2b2b082b08,
+    0x082b2b2b2b082b2b,
+    0x1908080808080819,
+    0x1908080808081908,
+    0x190808080808192b,
+    0x1908080808082b19,
+    0x1908080808190808,
+    0x190808080819082b,
+    0x1908080808191919,
+    0x1908080808192b08,
+    0x19080808082b0819,
+    0x19080808082b1908,
+    0x1908080819080808,
+    0x190808081908082b,
+    0x1908080819081919,
+    0x1908080819082b08,
+    0x1908080819082b2b,
+    0x1908080819190819,
+    0x1908080819191908,
+    0x19080808192b0808,
+    0x19080808192b1919,
+    0x190808082b080819,
+    0x190808082b081908,
+    0x190808082b190808,
+    0x1908081908080808,
+    0x190808190808082b,
+    0x1908081908081919,
+    0x1908081908082b08,
+    0x1908081908190819,
+    0x1908081908191908,
+    0x19080819082b0808,
+    0x1908081919080819,
+    0x1908081919081908,
+    0x1908081919190808,
+    0x190808192b080808,
+    0x190808192b081919,
+    0x190808192b2b082b,
+    0x1908082b08080819,
+    0x1908082b08081908,
+    0x1908082b08190808,
+    0x1908082b0819082b,
+    0x1908082b082b2b19,
+    0x1908082b19080808,
+    0x1908190808080808,
+    0x190819080808082b,
+    0x1908190808081919,
+    0x1908190808082b08,
+    0x1908190808190819,
+    0x1908190808191908,
+    0x1908190808192b19,
+    0x19081908082b0808,
+    0x1908190819080819,
+    0x1908190819081908,
+    0x1908190819190808,
+    0x190819082b080808,
+    0x190819082b191908,
+    0x1908191908080819,
+    0x1908191908081908,
+    0x1908191908190808,
+    0x19081919082b1908,
+    0x1908191919080808,
+    0x190819192b192b2b,
+    0x1908192b08080808,
+    0x1908192b08082b2b,
+    0x1908192b19081908,
+    0x1908192b19190808,
+    0x19082b0808080819,
+    0x19082b0808081908,
+    0x19082b0808190808,
+    0x19082b0819080808,
+    0x19082b0819081919,
+    0x19082b0819191908,
+    0x19082b08192b082b,
+    0x19082b1908080808,
+    0x19082b1908190819,
+    0x19082b1919081908,
+    0x19082b1919190808,
+    0x19082b19192b2b19,
+    0x19082b2b08081908,
+    0x1919080808080808,
+    0x191908080808082b,
+    0x1919080808081919,
+    0x1919080808082b08,
+    0x1919080808190819,
+    0x1919080808191908,
+    0x19190808082b0808,
+    0x19190808082b2b08,
+    0x1919080819080819,
+    0x1919080819081908,
+    0x1919080819190808,
+    0x191908082b080808,
+    0x1919081908080819,
+    0x1919081908081908,
+    0x1919081908190808,
+    0x1919081908191919,
+    0x1919081919080808,
+    0x191908191908082b,
+    0x1919082b08080808,
+    0x1919082b19081908,
+    0x1919082b2b2b2b2b,
+    0x1919190808080819,
+    0x1919190808081908,
+    0x1919190808190808,
+    0x19191908082b0819,
+    0x1919190819080808,
+    0x19191908192b0808,
+    0x191919082b080819,
+    0x191919082b2b0819,
+    0x1919191908080808,
+    0x1919191908082b08,
+    0x191919192b080808,
+    0x191919192b082b08,
+    0x1919192b082b0819,
+    0x1919192b192b2b08,
+    0x1919192b2b2b0819,
+    0x19192b0808080808,
+    0x19192b0808191908,
+    0x19192b0819080819,
+    0x19192b0819190808,
+    0x19192b082b192b19,
+    0x19192b1908192b2b,
+    0x19192b1919080808,
+    0x19192b191908082b,
+    0x19192b2b2b081919,
+    0x192b080808080819,
+    0x192b080808081908,
+    0x192b080808190808,
+    0x192b080819080808,
+    0x192b080819191908,
+    0x192b0808192b082b,
+    0x192b08082b08192b,
+    0x192b08082b2b2b19,
+    0x192b081908080808,
+    0x192b082b082b1908,
+    0x192b082b19082b2b,
+    0x192b082b2b19082b,
+    0x192b190808080808,
+    0x192b19080819192b,
+    0x192b191908190808,
+    0x192b191919080808,
+    0x192b191919081919,
+    0x192b19192b2b1908,
+    0x192b2b0808080819,
+    0x192b2b08192b2b2b,
+    0x192b2b19082b1919,
+    0x192b2b2b0808192b,
+    0x192b2b2b19191908,
+    0x192b2b2b192b082b,
+    0x2b08080808080808,
+    0x2b0808080808082b,
+    0x2b08080808081919,
+    0x2b08080808082b08,
+    0x2b08080808190819,
+    0x2b08080808191908,
+    0x2b080808082b0808,
+    0x2b080808082b2b2b,
+    0x2b08080819080819,
+    0x2b08080819081908,
+    0x2b08080819190808,
+    0x2b0808082b080808,
+    0x2b0808082b08082b,
+    0x2b0808082b2b2b08,
+    0x2b0808082b2b2b2b,
+    0x2b08081908080819,
+    0x2b08081908081908,
+    0x2b0808190808192b,
+    0x2b08081908190808,
+    0x2b08081919080808,
+    0x2b08081919190819,
+    0x2b08081919192b19,
+    0x2b08082b08080808,
+    0x2b08082b082b0808,
+    0x2b08082b2b080808,
+    0x2b08082b2b08082b,
+    0x2b08082b2b2b0808,
+    0x2b08082b2b2b2b08,
+    0x2b08190808080819,
+    0x2b08190808081908,
+    0x2b08190808190808,
+    0x2b0819080819082b,
+    0x2b08190808191919,
+    0x2b08190819080808,
+    0x2b081908192b0808,
+    0x2b0819082b082b19,
+    0x2b08191908080808,
+    0x2b08191919081908,
+    0x2b0819192b2b1919,
+    0x2b08192b08192b08,
+    0x2b08192b192b2b2b,
+    0x2b082b0808080808,
+    0x2b082b0808082b08,
+    0x2b082b08082b1919,
+    0x2b082b0819192b2b,
+    0x2b082b082b080808,
+    0x2b082b082b08082b,
+    0x2b082b082b2b2b08,
+    0x2b082b190808192b,
+    0x2b082b2b082b082b,
+    0x2b082b2b2b080808,
+    0x2b082b2b2b082b08,
+    0x2b082b2b2b19192b,
+    0x2b082b2b2b2b2b08,
+    0x2b19080808080819,
+    0x2b19080808081908,
+    0x2b19080808190808,
+    0x2b19080819080808,
+    0x2b1908081919192b,
+    0x2b1908082b081908,
+    0x2b19081908080808,
+    0x2b190819082b082b,
+    0x2b190819192b1908,
+    0x2b19082b1919192b,
+    0x2b19082b2b082b19,
+    0x2b19190808080808,
+    0x2b19190808081919,
+    0x2b19190819081908,
+    0x2b19190819190808,
+    0x2b19190819192b08,
+    0x2b191919082b2b19,
+    0x2b1919192b190808,
+    0x2b1919192b19082b,
+    0x2b19192b19080819,
+    0x2b192b0819190819,
+    0x2b192b082b2b192b,
+    0x2b192b1919082b19,
+    0x2b192b2b08191919,
+    0x2b192b2b192b0808,
+    0x2b2b080808080808,
+    0x2b2b08080808082b,
+    0x2b2b080808082b08,
+    0x2b2b080808082b2b,
+    0x2b2b0808082b0808,
+    0x2b2b0808082b2b2b,
+    0x2b2b08082b2b0808,
+    0x2b2b081919190819,
+    0x2b2b081919192b19,
+    0x2b2b08192b2b192b,
+    0x2b2b082b08080808,
+    0x2b2b082b0808082b,
+    0x2b2b082b08082b08,
+    0x2b2b082b082b2b2b,
+    0x2b2b082b2b080808,
+    0x2b2b082b2b2b0808,
+    0x2b2b190819080808,
+    0x2b2b19082b191919,
+    0x2b2b192b192b1919,
+    0x2b2b192b2b192b08,
+    0x2b2b2b0808082b2b,
+    0x2b2b2b08082b0808,
+    0x2b2b2b08082b082b,
+    0x2b2b2b08082b2b08,
+    0x2b2b2b082b2b0808,
+    0x2b2b2b082b2b2b08,
+    0x2b2b2b1908081908,
+    0x2b2b2b192b081908,
+    0x2b2b2b192b08192b,
+    0x2b2b2b2b082b2b08,
+    0x2b2b2b2b082b2b2b,
+    0x2b2b2b2b2b190819,
+    0x2b2b2b2b2b2b2b2b,
+];
+
+/// IQ3_XXS grid lookup table (256 entries, from llama.cpp ggml-common.h)
+/// Each u32 encodes 4 grid values (bytes), used for 3-bit importance-matrix quantization.
+const IQ3XXS_GRID: [u32; 256] = [
+    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
+    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
+    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
+    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
+    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
+    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
+    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
+    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
+    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
+    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
+    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
+    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
+    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
+    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
+    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
+    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
+    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
+    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
+    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
+    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
+    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
+    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
+    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
+    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
+    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
+    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
+    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
+    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
+    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+];
+
+/// IQ3_S grid lookup table (512 entries, from llama.cpp ggml-common.h)
+const IQ3S_GRID: [u32; 512] = [
+    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
+    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
+    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
+    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
+    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
+    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
+    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
+    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
+    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
+    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
+    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
+    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
+    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
+    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
+    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
+    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
+    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
+    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
+    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
+    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
+    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
+    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
+    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
+    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
+    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
+    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
+    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
+    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
+    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
+    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
+    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
+    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
+    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
+    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
+    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
+    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
+    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
+    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
+    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
+    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
+    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
+    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
+    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
+    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
+    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
+    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
+    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
+    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
+    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
+    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
+    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
+    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
+];
+
+/// Sign lookup table for IQ2/IQ3 formats (from llama.cpp ggml-common.h)
+/// Maps 7-bit sign index to 8-bit sign mask.
+const KSIGNS_IQ2XS: [u8; 128] = [
+    0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15, 144, 17, 18, 147, 20, 149,
+    150, 23, 24, 153, 154, 27, 156, 29, 30, 159, 160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170,
+    43, 172, 45, 46, 175, 48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
+    192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207, 80, 209, 210, 83, 212,
+    85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95, 96, 225, 226, 99, 228, 101, 102, 231, 232,
+    105, 106, 235, 108, 237, 238, 111, 240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123,
+    252, 125, 126, 255,
+];
+
+/// Bit mask table for sign extraction
+const KMASK_IQ2XS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/// CPU IQ3_XXS dequant matvec
+/// Block layout (256 elements, 98 bytes):
+///   f16 d (2B) + qs[96] where first 64B are grid indices, last 32B are scales_and_signs
+/// 8 groups of 32 elements. Each group: 8 grid indices (qs), then 4-byte u32 with:
+///   - bits 0..6: signs for sub-group 0, bits 7..13: sub-group 1, bits 14..20: sub-group 2, bits 21..27: sub-group 3
+///   - bits 28..31: 4-bit scale (actual scale = 0.5 + scale_bits) * 0.5
+fn matvec_iq3_xxs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let block_bytes = 98usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let d = f16_to_f32(w[boff], w[boff + 1]);
+            let qs_off = boff + 2; // grid indices start here
+            let scales_signs_off = qs_off + 64; // 256/4 = 64 bytes of grid indices
+
+            // 8 groups of 32 elements
+            for ib32 in 0..8 {
+                // Read 4-byte scale+signs word
+                let ss_off = scales_signs_off + ib32 * 4;
+                let aux32 =
+                    u32::from_le_bytes([w[ss_off], w[ss_off + 1], w[ss_off + 2], w[ss_off + 3]]);
+                let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+                let x_base = b * block_size + ib32 * 32;
+
+                // 4 sub-groups of 8 elements each
+                for l in 0..4usize {
+                    let signs = KSIGNS_IQ2XS[((aux32 >> (7 * l)) & 127) as usize];
+                    let grid_idx0 = w[qs_off + ib32 * 8 + 2 * l] as usize;
+                    let grid_idx1 = w[qs_off + ib32 * 8 + 2 * l + 1] as usize;
+                    let grid1 = IQ3XXS_GRID[grid_idx0].to_le_bytes();
+                    let grid2 = IQ3XXS_GRID[grid_idx1].to_le_bytes();
+                    for j in 0..4 {
+                        let sign1 = if signs & KMASK_IQ2XS[j] != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
+                        let sign2 = if signs & KMASK_IQ2XS[j + 4] != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
+                        sum += db * grid1[j] as f32 * sign1 * x[x_base + l * 8 + j];
+                        sum += db * grid2[j] as f32 * sign2 * x[x_base + l * 8 + j + 4];
+                    }
+                }
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU IQ3_S dequant matvec
+/// Block layout (256 elements, 110 bytes):
+///   f16 d (2B) + qs[64] + qh[8] + signs[32] + scales[4]
+/// qs: 8-bit grid indices (low), qh: 9th bit for grid index (512-entry grid)
+/// signs: 8-bit sign masks per group of 8 elements
+/// scales: 4-bit scales per pair of 32-element groups (nibbles)
+fn matvec_iq3_s_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let block_bytes = 110usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let d = f16_to_f32(w[boff], w[boff + 1]);
+            let qs_base = boff + 2;
+            let qh_base = qs_base + 64;
+            let signs_base = qh_base + 8;
+            let scales_base = signs_base + 32;
+            let x_base_block = b * block_size;
+
+            // Process pairs of 32-element groups (ib32 steps by 2)
+            for ib32 in (0..8).step_by(2) {
+                let scale_byte = w[scales_base + ib32 / 2];
+                let db1 = d * (1 + 2 * (scale_byte & 0x0f) as i32) as f32;
+                let db2 = d * (1 + 2 * (scale_byte >> 4) as i32) as f32;
+
+                // First group of 32
+                let qh0 = w[qh_base + ib32];
+                let signs_off0 = signs_base + ib32 * 4;
+                let qs_off0 = qs_base + ib32 * 8;
+                for l in 0..4usize {
+                    let grid_idx =
+                        w[qs_off0 + 2 * l] as usize | (((qh0 as usize) << (8 - 2 * l)) & 256);
+                    let grid_idx2 =
+                        w[qs_off0 + 2 * l + 1] as usize | (((qh0 as usize) << (7 - 2 * l)) & 256);
+                    let grid1 = IQ3S_GRID[grid_idx].to_le_bytes();
+                    let grid2 = IQ3S_GRID[grid_idx2].to_le_bytes();
+                    let sign_byte = w[signs_off0 + l];
+                    let x_off = x_base_block + ib32 * 32 + l * 8;
+                    for j in 0..4 {
+                        let s1 = if sign_byte & KMASK_IQ2XS[j] != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
+                        let s2 = if sign_byte & KMASK_IQ2XS[j + 4] != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
+                        sum += db1 * grid1[j] as f32 * s1 * x[x_off + j];
+                        sum += db1 * grid2[j] as f32 * s2 * x[x_off + j + 4];
+                    }
+                }
+
+                // Second group of 32
+                let qh1 = w[qh_base + ib32 + 1];
+                let signs_off1 = signs_base + (ib32 + 1) * 4;
+                let qs_off1 = qs_base + (ib32 + 1) * 8;
+                for l in 0..4usize {
+                    let grid_idx =
+                        w[qs_off1 + 2 * l] as usize | (((qh1 as usize) << (8 - 2 * l)) & 256);
+                    let grid_idx2 =
+                        w[qs_off1 + 2 * l + 1] as usize | (((qh1 as usize) << (7 - 2 * l)) & 256);
+                    let grid1 = IQ3S_GRID[grid_idx].to_le_bytes();
+                    let grid2 = IQ3S_GRID[grid_idx2].to_le_bytes();
+                    let sign_byte = w[signs_off1 + l];
+                    let x_off = x_base_block + (ib32 + 1) * 32 + l * 8;
+                    for j in 0..4 {
+                        let s1 = if sign_byte & KMASK_IQ2XS[j] != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
+                        let s2 = if sign_byte & KMASK_IQ2XS[j + 4] != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
+                        sum += db2 * grid1[j] as f32 * s1 * x[x_off + j];
+                        sum += db2 * grid2[j] as f32 * s2 * x[x_off + j + 4];
+                    }
+                }
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU IQ2_XXS dequant matvec
+/// Block layout (256 elements, 66 bytes):
+///   f16 d (2B) + uint16_t qs[32] (64B)
+/// 8 groups of 32 elements. Each group: 4 uint16 = 8 bytes interpreted as 2 × u32.
+///   aux32[0] bytes → 4 grid indices into iq2xxs_grid[256] (each u64 = 8 values)
+///   aux32[1] → bits 0-27: 4 × 7-bit sign indices, bits 28-31: 4-bit scale
+///   scale = d * (0.5 + scale_bits) * 0.25
+fn matvec_iq2_xxs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let block_bytes = 66usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let d = f16_to_f32(w[boff], w[boff + 1]);
+            let qs_off = boff + 2;
+
+            // 8 groups of 32 elements
+            for ib32 in 0..8 {
+                // Read 8 bytes (4 uint16) as 2 × u32
+                let g_off = qs_off + ib32 * 8;
+                let aux32_0 =
+                    u32::from_le_bytes([w[g_off], w[g_off + 1], w[g_off + 2], w[g_off + 3]]);
+                let aux32_1 =
+                    u32::from_le_bytes([w[g_off + 4], w[g_off + 5], w[g_off + 6], w[g_off + 7]]);
+                let db = d * (0.5 + (aux32_1 >> 28) as f32) * 0.25;
+                let x_base = b * block_size + ib32 * 32;
+                let aux8 = aux32_0.to_le_bytes();
+
+                // 4 sub-groups of 8 elements
+                for l in 0..4usize {
+                    let grid_idx = aux8[l] as usize;
+                    let grid = IQ2XXS_GRID[grid_idx].to_le_bytes();
+                    let signs = KSIGNS_IQ2XS[((aux32_1 >> (7 * l)) & 127) as usize];
+                    for j in 0..8 {
+                        let sign = if signs & KMASK_IQ2XS[j] != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
+                        sum += db * grid[j] as f32 * sign * x[x_base + l * 8 + j];
+                    }
+                }
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU IQ2_XS dequant matvec
+/// Block layout (256 elements, 74 bytes):
+///   f16 d (2B) + uint16_t qs[32] (64B) + uint8_t scales[8] (8B)
+/// 8 groups of 32 elements. Each uint16_t qs:
+///   bits 0-8: 9-bit grid index into iq2xs_grid[512]
+///   bits 9-15: 7-bit sign index into ksigns_iq2xs
+/// scales: 4-bit scale per group pair (low nibble = even group, high = odd)
+///   scale = d * (0.5 + scale_nibble) * 0.25
+fn matvec_iq2_xs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let block_size = 256usize;
+    let block_bytes = 74usize;
+    let blocks_per_row = in_dim / block_size;
+    let mut y = vec![0.0f32; out_dim];
+
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * blocks_per_row * block_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let boff = row_off + b * block_bytes;
+            let d = f16_to_f32(w[boff], w[boff + 1]);
+            let qs_off = boff + 2;
+            let scales_off = qs_off + 64;
+            let x_base_block = b * block_size;
+
+            for ib32 in 0..8 {
+                let scale_byte = w[scales_off + ib32 / 2];
+                let scale_nibble = if ib32 % 2 == 0 {
+                    scale_byte & 0x0f
+                } else {
+                    scale_byte >> 4
+                };
+                let db = d * (0.5 + scale_nibble as f32) * 0.25;
+                let x_base = x_base_block + ib32 * 32;
+
+                // 4 uint16_t per group of 32 elements (each uint16 → 8 elements)
+                for l in 0..4usize {
+                    let q_off = qs_off + (ib32 * 4 + l) * 2;
+                    let qs_val = u16::from_le_bytes([w[q_off], w[q_off + 1]]);
+                    let grid_idx = (qs_val & 511) as usize;
+                    let sign_idx = (qs_val >> 9) as usize;
+                    let grid = IQ2XS_GRID[grid_idx].to_le_bytes();
+                    let signs = KSIGNS_IQ2XS[sign_idx];
+                    for j in 0..8 {
+                        let sign = if signs & KMASK_IQ2XS[j] != 0 {
+                            -1.0f32
+                        } else {
+                            1.0f32
+                        };
+                        sum += db * grid[j] as f32 * sign * x[x_base + l * 8 + j];
+                    }
+                }
+            }
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// Convert two bytes (little-endian) to f32 via f16
+#[inline]
+fn f16_to_f32(lo: u8, hi: u8) -> f32 {
+    half::f16::from_bits(lo as u16 | ((hi as u16) << 8)).to_f32()
+}
+
+/// Convert BF16 (brain float 16) to f32
+/// BF16 is simply the upper 16 bits of f32, so we shift left by 16
+fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
+    let bits = (lo as u32) | ((hi as u32) << 8);
+    f32::from_bits(bits << 16)
+}
+
+/// CPU BF16 matvec: each weight is 2 bytes (BF16), dequantize on the fly
+fn matvec_bf16_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; out_dim];
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * in_dim * 2;
+        let mut sum = 0.0f32;
+        for (col, &xv) in x.iter().enumerate().take(in_dim) {
+            let off = row_off + col * 2;
+            let w_f32 = bf16_to_f32(w[off], w[off + 1]);
+            sum += w_f32 * xv;
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+/// CPU F16 matvec: each weight is 2 bytes (IEEE 754 half), dequantize on the fly
+pub(crate) fn matvec_f16_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; out_dim];
+    for (row, y_val) in y.iter_mut().enumerate() {
+        let row_off = row * in_dim * 2;
+        let mut sum = 0.0f32;
+        for (col, &xv) in x.iter().enumerate().take(in_dim) {
+            let off = row_off + col * 2;
+            let w_f32 = f16_to_f32(w[off], w[off + 1]);
+            sum += w_f32 * xv;
+        }
+        *y_val = sum;
+    }
+    y
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_matvec_identity() {
+        let w = vec![1.0, 0.0, 0.0, 1.0];
+        let x = vec![3.0, 4.0];
+        let y = matvec_f32_simd(&w, &x, 2, 2);
+        assert!((y[0] - 3.0).abs() < 1e-6);
+        assert!((y[1] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_matvec_3x2() {
+        // [[1,2],[3,4],[5,6]] × [1,1] = [3, 7, 11]
+        let w = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let x = vec![1.0, 1.0];
+        let y = matvec_f32_simd(&w, &x, 3, 2);
+        assert!((y[0] - 3.0).abs() < 1e-6);
+        assert!((y[1] - 7.0).abs() < 1e-6);
+        assert!((y[2] - 11.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_softmax() {
+        let mut x = vec![1.0, 2.0, 3.0];
+        softmax_f32_fast(&mut x);
+        let sum: f32 = x.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+        assert!(x[2] > x[1] && x[1] > x[0]);
+    }
+
+    #[test]
+    fn test_softmax_single() {
+        let mut x = vec![42.0];
+        softmax_f32_fast(&mut x);
+        assert!((x[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_rmsnorm() {
+        let mut x = vec![1.0, 2.0, 3.0, 4.0];
+        let w = vec![1.0, 1.0, 1.0, 1.0];
+        rmsnorm_f32_fast(&mut x, &w, 1e-5);
+        let rms: f32 = (1.0 + 4.0 + 9.0 + 16.0) / 4.0 + 1e-5;
+        let inv_rms = 1.0 / rms.sqrt();
+        assert!((x[0] - inv_rms).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_silu() {
+        let mut x = vec![0.0, 1.0, -1.0];
+        silu_f32(&mut x);
+        assert!((x[0] - 0.0).abs() < 1e-6); // silu(0) = 0
+        assert!(x[1] > 0.5); // silu(1) ≈ 0.731
+        assert!(x[2] < 0.0 && x[2] > -0.5); // silu(-1) ≈ -0.269
+    }
+
+    #[test]
+    fn test_matvec_q4_0_cpu_basic() {
+        // 1 row, 32 elements (1 block)
+        // Block: f16 scale = 1.0, then 16 bytes of nibbles
+        let scale_bits = half::f16::from_f32(1.0).to_bits();
+        let mut block = vec![scale_bits as u8, (scale_bits >> 8) as u8];
+        // All nibbles = 8 (so value = 8-8 = 0), except first byte = 0x19 (lo=9-8=1, hi=1-8=-7... wait)
+        // Simpler: all zero nibbles => val = 0-8 = -8 each
+        // With x = [1.0; 32], sum = scale * sum_of_dequantized * x
+        // Let's use all 0x88 nibbles: lo = 8, hi = 8, dequant = 0
+        for _ in 0..16 {
+            block.push(0x88);
+        }
+        let x = vec![1.0f32; 32];
+        let y = matvec_q4_0_cpu(&block, &x, 1, 32);
+        assert!(
+            (y[0] - 0.0).abs() < 1e-5,
+            "All zeros should give 0, got {}",
+            y[0]
+        );
+    }
+
+    #[test]
+    fn test_matvec_q8_0_cpu_basic() {
+        // 1 row, 32 elements (1 block)
+        let scale_bits = half::f16::from_f32(1.0).to_bits();
+        let mut block = vec![scale_bits as u8, (scale_bits >> 8) as u8];
+        // 32 int8 values, all = 1
+        for _ in 0..32 {
+            block.push(1u8);
+        }
+        let x = vec![1.0f32; 32];
+        let y = matvec_q8_0_cpu(&block, &x, 1, 32);
+        // Each val = 1.0 * 1 = 1.0, dot with x[j]=1.0 => sum = 32.0
+        assert!((y[0] - 32.0).abs() < 1e-3, "Expected 32.0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_matvec_q3_k_cpu_basic() {
+        // 1 row, 256 elements (1 block = 110 bytes)
+        // Block: 32B hmask + 64B qs + 12B scales + 2B f16 d
+        let mut block = vec![0u8; 110];
+        // Set d = 1.0
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[108] = d_bits as u8;
+        block[109] = (d_bits >> 8) as u8;
+        // All qs = 0, hmask = 0, scales = 0 => all quant values = 0-4 = -4, but scale=0 => sum=0
+        // Actually scale bytes are all 0 so sc_f = 0 for all sub-blocks
+        let x = vec![1.0f32; 256];
+        let y = matvec_q3_k_cpu(&block, &x, 1, 256);
+        assert!(y[0].abs() < 1e-5, "Zero scales should give 0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_matvec_q5_k_cpu_basic() {
+        // 1 row, 256 elements (1 block = 176 bytes)
+        // Block: 2B d + 2B dmin + 12B scales + 32B qh + 128B ql
+        let mut block = vec![0u8; 176];
+        // Set d = 1.0, dmin = 0.0
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // dmin = 0 (already 0)
+        // All scales = 0, ql = 0, qh = 0 => scale=0, min=0, all values = 0
+        let x = vec![1.0f32; 256];
+        let y = matvec_q5_k_cpu(&block, &x, 1, 256);
+        assert!(y[0].abs() < 1e-5, "Zero scales should give 0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_matvec_q3_k_cpu_nonzero() {
+        // Test with nonzero scale to verify dequantization produces something
+        let mut block = vec![0u8; 110];
+        let d_bits = half::f16::from_f32(0.5).to_bits();
+        block[108] = d_bits as u8;
+        block[109] = (d_bits >> 8) as u8;
+        // Set scale for sub-block 0: low4=1, hi2=0 => scale_val=1, sc_f=0.5*1=0.5
+        block[96] = 0x01; // low nibble for sb=0
+                          // hmask and qs all zero => each quant = (0|0) - 4 = -4
+                          // sub-block 0 has 16 values each = -4, sc_f=0.5 => contribution = 0.5 * (-4) * 1.0 * 16 = -32
+        let x = vec![1.0f32; 256];
+        let y = matvec_q3_k_cpu(&block, &x, 1, 256);
+        assert!(
+            (y[0] - (-32.0)).abs() < 1e-3,
+            "Expected -32.0, got {}",
+            y[0]
+        );
+    }
+
+    #[test]
+    fn test_matvec_q5_k_cpu_nonzero() {
+        // Test with scale=1, dmin=0, ql all 0x11 (lo=1, hi=1), qh=0
+        // sub-block 0 scale_low=1 => scale=1.0*1=1.0, min=0
+        let mut block = vec![0u8; 176];
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // scale for sub-block 0: sc[0] low 6 bits = 1
+        block[4] = 0x01;
+        // ql for sub-block 0 (16 bytes at offset 48): each = 0x11 => low=1, high=1
+        for j in 0..16 {
+            block[48 + j] = 0x11;
+        }
+        // qh all 0 => hbit=0
+        // v0 = 1.0 * (1 | 0) - 0 = 1.0, v1 = 1.0 * (1 | 0) - 0 = 1.0
+        // 32 values * 1.0 * x[i]=1.0 = 32.0
+        let x = vec![1.0f32; 256];
+        let y = matvec_q5_k_cpu(&block, &x, 1, 256);
+        assert!((y[0] - 32.0).abs() < 1e-3, "Expected 32.0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_matvec_q2_k_cpu_basic() {
+        // 1 row, 256 elements (1 block = 84 bytes)
+        // Block: f16 d + f16 dmin + 16B scales + 64B qs
+        let mut block = vec![0u8; 84];
+        // d = 1.0, dmin = 0.0
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // dmin = 0, all scales = 0, all qs = 0 => scale=0, min=0 => sum=0
+        let x = vec![1.0f32; 256];
+        let y = matvec_q2_k_cpu(&block, &x, 1, 256);
+        assert!(y[0].abs() < 1e-5, "Zero scales should give 0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_matvec_q2_k_cpu_nonzero() {
+        // Test with scale=1, dmin=0, sub-block 0 scale_nibble=2
+        // qs for sub-block 0: all bits = 01 => q=1
+        let mut block = vec![0u8; 84];
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // dmin = 0
+        // sc[0] low nibble = 2 (scale=2.0), high nibble = 0 (min=0)
+        block[4] = 0x02;
+        // qs for sub-block 0 elements [0..16] → indices 0..15 in qs (bytes 0..3)
+        // Each byte holds 4 quants at 2 bits. Set all to 01 = 0x55
+        for j in 0..4 {
+            block[20 + j] = 0x55; // 01 01 01 01
+        }
+        // Sub-block 0: 16 elements, each q=1, scale=2.0, min=0
+        // contribution = 2.0 * 1 * 1.0 * 16 = 32.0
+        let x = vec![1.0f32; 256];
+        let y = matvec_q2_k_cpu(&block, &x, 1, 256);
+        assert!((y[0] - 32.0).abs() < 1e-3, "Expected 32.0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_matvec_q2_k_cpu_with_min() {
+        // Test that dmin subtracts correctly
+        let mut block = vec![0u8; 84];
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        let dmin_bits = half::f16::from_f32(0.5).to_bits();
+        block[2] = dmin_bits as u8;
+        block[3] = (dmin_bits >> 8) as u8;
+        // sc[0]: low nibble = 0 (scale=0), high nibble = 2 (min=0.5*2=1.0)
+        block[4] = 0x20;
+        // qs all 0 => q=0 for everything
+        // Sub-block 0: 16 elements, each = (0*0 - 1.0) = -1.0
+        // contribution = -1.0 * 1.0 * 16 = -16.0
+        let x = vec![1.0f32; 256];
+        let y = matvec_q2_k_cpu(&block, &x, 1, 256);
+        assert!(
+            (y[0] - (-16.0)).abs() < 1e-3,
+            "Expected -16.0, got {}",
+            y[0]
+        );
+    }
+
+    #[test]
+    fn test_matvec_q8_k_cpu_basic() {
+        // 1 row, 256 elements (1 block = 292 bytes)
+        // Block: f32 d (4B) + 256B qs (int8) + 32B bsums
+        let mut block = vec![0u8; 292];
+        // d = 1.0 (f32 little-endian)
+        let d_bytes = 1.0f32.to_le_bytes();
+        block[0..4].copy_from_slice(&d_bytes);
+        // All qs = 1 (int8)
+        for j in 0..256 {
+            block[4 + j] = 1u8;
+        }
+        let x = vec![1.0f32; 256];
+        let y = matvec_q8_k_cpu(&block, &x, 1, 256);
+        // Each val = 1.0 * 1 = 1.0, sum = 256.0
+        assert!((y[0] - 256.0).abs() < 1e-3, "Expected 256.0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_matvec_q8_k_cpu_negative() {
+        // Test with negative values
+        let mut block = vec![0u8; 292];
+        let d_bytes = 0.5f32.to_le_bytes();
+        block[0..4].copy_from_slice(&d_bytes);
+        // All qs = -2 (0xFE as i8)
+        for j in 0..256 {
+            block[4 + j] = 0xFE; // -2 as i8
+        }
+        let x = vec![1.0f32; 256];
+        let y = matvec_q8_k_cpu(&block, &x, 1, 256);
+        // Each val = 0.5 * (-2) = -1.0, sum = -256.0
+        assert!(
+            (y[0] - (-256.0)).abs() < 1e-3,
+            "Expected -256.0, got {}",
+            y[0]
+        );
+    }
+
+    #[test]
+    fn test_f16_to_f32_roundtrip() {
+        let bits = half::f16::from_f32(3.14).to_bits();
+        let result = f16_to_f32(bits as u8, (bits >> 8) as u8);
+        assert!((result - 3.14).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_matvec_iq4_nl_cpu_basic() {
+        // 1 row, 32 elements = 1 block, 18 bytes
+        let mut block = vec![0u8; 18];
+        // d = 1.0 as f16
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // All qs = 0x00 → lo=0, hi=0 → both map to IQ4_NL_QUANTS[0] = -127
+        for j in 0..16 {
+            block[2 + j] = 0x00;
+        }
+        let x = vec![1.0f32; 32];
+        let y = matvec_iq4_nl_cpu(&block, &x, 1, 32);
+        let expected = 1.0 * -127.0 * 32.0;
+        assert!(
+            (y[0] - expected).abs() < 1.0,
+            "Expected {}, got {}",
+            expected,
+            y[0]
+        );
+    }
+
+    #[test]
+    fn test_matvec_iq4_nl_cpu_lut_values() {
+        // Verify lookup table mapping: index 8 → +1, index 15 → +113
+        let mut block = vec![0u8; 18];
+        let d_bits = half::f16::from_f32(0.5).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // First byte: lo=8 (val=1), hi=15 (val=113)
+        block[2] = 0xF8; // hi=15, lo=8
+                         // Rest are 0
+        let mut x = vec![0.0f32; 32];
+        x[0] = 1.0; // multiplied by LUT[8]=1
+        x[1] = 1.0; // multiplied by LUT[15]=113
+        let y = matvec_iq4_nl_cpu(&block, &x, 1, 32);
+        let expected = 0.5 * (1.0 + 113.0);
+        assert!(
+            (y[0] - expected).abs() < 0.5,
+            "Expected {}, got {}",
+            expected,
+            y[0]
+        );
+    }
+
+    #[test]
+    fn test_matvec_iq4_nl_cpu_two_rows() {
+        // 2 rows × 32 elements = 2 blocks
+        let mut data = vec![0u8; 36]; // 2 × 18 bytes
+        let d1 = half::f16::from_f32(1.0).to_bits();
+        let d2 = half::f16::from_f32(2.0).to_bits();
+        data[0] = d1 as u8;
+        data[1] = (d1 >> 8) as u8;
+        // index 8 = +1 for all
+        for j in 0..16 {
+            data[2 + j] = 0x88;
+        }
+        data[18] = d2 as u8;
+        data[19] = (d2 >> 8) as u8;
+        for j in 0..16 {
+            data[20 + j] = 0x88;
+        }
+        let x = vec![1.0f32; 32];
+        let y = matvec_iq4_nl_cpu(&data, &x, 2, 32);
+        // IQ4_NL_QUANTS[8] = 1, so row0 = 1.0 * 1 * 32 = 32, row1 = 2.0 * 1 * 32 = 64
+        assert!(
+            (y[0] - 32.0).abs() < 1.0,
+            "Row 0: expected 32.0, got {}",
+            y[0]
+        );
+        assert!(
+            (y[1] - 64.0).abs() < 1.0,
+            "Row 1: expected 64.0, got {}",
+            y[1]
+        );
+    }
+
+    #[test]
+    fn test_matvec_iq4_xs_cpu_basic() {
+        // 1 row, 256 elements = 1 block, 148 bytes
+        let mut block = vec![0u8; 148];
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // scales_h = 0 (all high bits zero)
+        block[2] = 0;
+        block[3] = 0;
+        // scales_l: we want scale = (sl | sh<<4) - 32 = sl - 32
+        // Set sl = 33 (nibble = 1 for even sub-blocks) so scale = 33 - 32 = 1
+        // Actually for simplicity set all scales_l words so each nibble = 0
+        // Then scale = (0 | 0) - 32 = -32
+        // Set all qs to index 8 (val=1): byte = 0x88
+        for j in 0..16 {
+            block[4 + j] = 0x00; // scales_l all 0
+        }
+        for j in 0..128 {
+            block[20 + j] = 0x88; // all index 8 → IQ4_NL_QUANTS[8] = 1
+        }
+        let x = vec![1.0f32; 256];
+        let y = matvec_iq4_xs_cpu(&block, &x, 1, 256);
+        // Each element: d * scale * 1 = 1.0 * (-32) * 1 = -32, total = -32 * 256
+        let expected = 1.0 * -32.0 * 256.0;
+        assert!(
+            (y[0] - expected).abs() < 10.0,
+            "Expected {}, got {}",
+            expected,
+            y[0]
+        );
+    }
+
+    #[test]
+    fn test_matvec_iq4_xs_cpu_positive_scale() {
+        // Set scales so scale = 1.0 (sl=1, sh=2 → 1 | 8 = 33 - 32 = 1)
+        let mut block = vec![0u8; 148];
+        let d_bits = half::f16::from_f32(0.01).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // scales_h: sh=2 for all sub-blocks → bit pairs = 10
+        // Sub-block 0: bits 1:0 = 2, sub-block 1: bits 3:2 = 2, etc.
+        // = 0b10_10_10_10_10_10_10_10 = 0xAAAA
+        block[2] = 0xAA;
+        block[3] = 0xAA;
+        // scales_l: sl=1 for all nibbles
+        // Each u16 word: nibble0=1, nibble1=1 → 0x0011
+        for i in 0..8 {
+            block[4 + i * 2] = 0x11;
+            block[5 + i * 2] = 0x00;
+        }
+        // qs: all index 8 → val=1
+        for j in 0..128 {
+            block[20 + j] = 0x88;
+        }
+        let x = vec![1.0f32; 256];
+        let y = matvec_iq4_xs_cpu(&block, &x, 1, 256);
+        // scale = (1 | (2<<4)) - 32 = 33 - 32 = 1
+        // Each element: 0.01 * 1 * 1 = 0.01, total ≈ 0.01 * 256 = 2.56
+        assert!((y[0] - 2.56).abs() < 0.5, "Expected ~2.56, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_iq4_nl_lut_symmetry() {
+        // LUT has 16 entries from -127 to +113, roughly symmetric around 0
+        assert_eq!(IQ4_NL_QUANTS[0], -127);
+        assert_eq!(IQ4_NL_QUANTS[15], 113);
+        assert_eq!(IQ4_NL_QUANTS[8], 1); // close to 0 crossing
+    }
+
+    #[test]
+    fn test_matvec_iq4_nl_cpu_dispatch() {
+        // Test through the dispatch function
+        let mut block = vec![0u8; 18];
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        for j in 0..16 {
+            block[2 + j] = 0x88; // all index 8 → val=1
+        }
+        let x = vec![1.0f32; 32];
+        let y = matvec_quantized_cpu(&block, &x, 1, 32, GgmlType::IQ4NL);
+        assert!((y[0] - 32.0).abs() < 1.0, "Expected ~32.0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_matvec_iq4_xs_cpu_dispatch() {
+        let mut block = vec![0u8; 148];
+        let d_bits = half::f16::from_f32(0.01).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        block[2] = 0xAA;
+        block[3] = 0xAA;
+        for i in 0..8 {
+            block[4 + i * 2] = 0x11;
+            block[5 + i * 2] = 0x00;
+        }
+        for j in 0..128 {
+            block[20 + j] = 0x88;
+        }
+        let x = vec![1.0f32; 256];
+        let y = matvec_quantized_cpu(&block, &x, 1, 256, GgmlType::IQ4XS);
+        assert!((y[0] - 2.56).abs() < 0.5, "Expected ~2.56, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_iq3_xxs_basic() {
+        // One block: 98 bytes for 256 elements
+        // Layout: f16 d (2B) + qs[96] (64B grid indices + 32B scales_and_signs)
+        let mut block = vec![0u8; 98];
+        // d = 1.0 in f16
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // Grid indices all 0 → IQ3XXS_GRID[0] = 0x04040404 → bytes [4,4,4,4]
+        // scales_and_signs: set scale=0 (top 4 bits=0), signs=0 (all positive)
+        // db = (0.5 + 0) * 0.5 = 0.25
+        // Each element = 4 * 0.25 = 1.0
+        let x = vec![1.0f32; 256];
+        let y = matvec_quantized_cpu(&block, &x, 1, 256, GgmlType::IQ3XXS);
+        // All 256 elements contribute 1.0 each
+        assert!((y[0] - 256.0).abs() < 1.0, "Expected ~256.0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_iq3_xxs_with_signs() {
+        let mut block = vec![0u8; 98];
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // Grid indices all 0 → grid values [4,4,4,4]
+        // Set signs for first sub-group to all negative (sign index = 0 → signs byte = 0 → all positive)
+        // Sign index 127 → KSIGNS_IQ2XS[127] = 255 → all bits set → all negative
+        // Set first group's aux32 to have sign index 127 for sub-group 0
+        let ss_off = 2 + 64; // scales_and_signs offset
+        let aux32: u32 = 127; // bits 0..6 = 127 (all negative for first 8 elements), rest 0
+        block[ss_off] = aux32 as u8;
+        block[ss_off + 1] = (aux32 >> 8) as u8;
+        block[ss_off + 2] = (aux32 >> 16) as u8;
+        block[ss_off + 3] = (aux32 >> 24) as u8;
+
+        let x = vec![1.0f32; 256];
+        let y = matvec_quantized_cpu(&block, &x, 1, 256, GgmlType::IQ3XXS);
+        // First 8 elements are negative (sign=−1), so contribution = 8 * 4 * 0.25 * (−1) = −8
+        // Remaining 248 elements all positive: 248 * 4 * 0.25 = 248
+        // Total ≈ 248 − 8 = 240
+        assert!((y[0] - 240.0).abs() < 1.0, "Expected ~240.0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_iq3_s_basic() {
+        // One block: 110 bytes for 256 elements
+        // Layout: f16 d (2B) + qs[64] + qh[8] + signs[32] + scales[4]
+        let mut block = vec![0u8; 110];
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // Grid indices all 0 → IQ3S_GRID[0] = 0x01010101 → bytes [1,1,1,1]
+        // qh all 0 → no 9th bit
+        // signs all 0 → all positive
+        // scales all 0 → scale = 1 + 2*0 = 1
+        // Each element = 1.0 * 1 * 1 = 1.0
+        let x = vec![1.0f32; 256];
+        let y = matvec_quantized_cpu(&block, &x, 1, 256, GgmlType::IQ3S);
+        assert!((y[0] - 256.0).abs() < 1.0, "Expected ~256.0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_iq3_s_with_scale() {
+        let mut block = vec![0u8; 110];
+        let d_bits = half::f16::from_f32(0.5).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // Set scales to 0x31 → low nibble=1, high nibble=3
+        // db1 = 0.5 * (1 + 2*1) = 1.5, db2 = 0.5 * (1 + 2*3) = 3.5
+        let scales_base = 2 + 64 + 8 + 32;
+        for i in 0..4 {
+            block[scales_base + i] = 0x31;
+        }
+        // Grid values all [1,1,1,1], signs all positive
+        let x = vec![1.0f32; 256];
+        let y = matvec_quantized_cpu(&block, &x, 1, 256, GgmlType::IQ3S);
+        // 4 pairs of groups. Each pair: 32 elements * db1 + 32 elements * db2
+        // = 4 * (32 * 1.5 + 32 * 3.5) = 4 * (48 + 112) = 4 * 160 = 640
+        assert!((y[0] - 640.0).abs() < 2.0, "Expected ~640.0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_iq3_s_with_signs() {
+        let mut block = vec![0u8; 110];
+        let d_bits = half::f16::from_f32(1.0).to_bits();
+        block[0] = d_bits as u8;
+        block[1] = (d_bits >> 8) as u8;
+        // Grid values all [1,1,1,1], scale = 1
+        // Set first sign byte to 0xFF → all 8 elements negative
+        let signs_base = 2 + 64 + 8;
+        block[signs_base] = 0xFF;
+        let x = vec![1.0f32; 256];
+        let y = matvec_quantized_cpu(&block, &x, 1, 256, GgmlType::IQ3S);
+        // First 8 elements: -1.0 each = -8.0
+        // Remaining 248 elements: +1.0 each = 248.0
+        // Total = 240.0
+        assert!((y[0] - 240.0).abs() < 1.0, "Expected ~240.0, got {}", y[0]);
+    }
+
+    #[test]
+    fn test_iq3_xxs_grid_lookup() {
+        // Verify grid table values
+        assert_eq!(IQ3XXS_GRID[0], 0x04040404);
+        assert_eq!(IQ3XXS_GRID[255], 0x3e341c04);
+        // Bytes of grid[0]: [4, 4, 4, 4]
+        let bytes = IQ3XXS_GRID[0].to_le_bytes();
+        assert_eq!(bytes, [4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn test_iq3_s_grid_lookup() {
+        assert_eq!(IQ3S_GRID[0], 0x01010101);
+        assert_eq!(IQ3S_GRID[511], 0x0f0f0101);
+        let bytes = IQ3S_GRID[0].to_le_bytes();
+        assert_eq!(bytes, [1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_iq2_xxs_basic() {
+        // 1 row, 256 elements, 66 bytes per block
+        // Build a minimal block: f16 d + 64 bytes of qs
+        let mut block = vec![0u8; 66];
+        // d = 1.0 in f16 = 0x3C00
+        block[0] = 0x00;
+        block[1] = 0x3C;
+        // Group 0: aux32_0 bytes = [0, 0, 0, 0] → grid indices all 0
+        // IQ2XXS_GRID[0] = 0x0808080808080808 → all bytes = 8
+        // aux32_1 = 0 → signs = KSIGNS_IQ2XS[0] = 0 (all positive), scale_bits = 0
+        // db = 1.0 * (0.5 + 0) * 0.25 = 0.125
+        // Each element = 0.125 * 8 = 1.0
+
+        let x = vec![1.0f32; 256];
+        let y = matvec_iq2_xxs_cpu(&block, &x, 1, 256);
+        // Group 0: 32 elements each = 1.0, all 8 groups same → sum = 256.0
+        assert!((y[0] - 256.0).abs() < 1.0, "IQ2_XXS basic: got {}", y[0]);
+    }
+
+    #[test]
+    fn test_iq2_xxs_with_signs() {
+        let mut block = vec![0u8; 66];
+        block[0] = 0x00;
+        block[1] = 0x3C; // d = 1.0
+                         // Group 0: grid index 0 for all, sign index 127 → KSIGNS_IQ2XS[127] = 255 (all negative)
+                         // aux32_1 = 127 (7 bits for group 0 signs) = 0x0000007F
+        block[2 + 4] = 0x7F; // aux32_1 low byte = 127
+        block[2 + 5] = 0x00;
+        block[2 + 6] = 0x00;
+        block[2 + 7] = 0x00;
+
+        let x = vec![1.0f32; 256];
+        let y = matvec_iq2_xxs_cpu(&block, &x, 1, 256);
+        // Group 0, sub-group 0: all signs negative → -8 * 0.125 * 8 = -8.0
+        // Sub-groups 1-3: sign index 0 → all positive → +8.0 each
+        // Group 0 subtotal = -8.0 + 8.0 + 8.0 + 8.0 = 16.0
+        // Groups 1-7 all zeros → sum = 16.0... but actually all groups have same aux32
+        // Only group 0 has non-zero aux32_1; groups 1-7 have aux32_1 = 0
+        assert!(
+            y[0].abs() > 0.0,
+            "IQ2_XXS signs test should produce non-zero result"
+        );
+    }
+
+    #[test]
+    fn test_iq2_xxs_grid_lookup() {
+        assert_eq!(IQ2XXS_GRID[0], 0x0808080808080808);
+        assert_eq!(IQ2XXS_GRID[255], 0x2b2b2b1908081908);
+        let bytes = IQ2XXS_GRID[0].to_le_bytes();
+        assert!(bytes.iter().all(|&b| b == 0x08));
+    }
+
+    #[test]
+    fn test_iq2_xs_basic() {
+        // 1 row, 256 elements, 74 bytes per block
+        let mut block = vec![0u8; 74];
+        // d = 1.0 in f16
+        block[0] = 0x00;
+        block[1] = 0x3C;
+        // qs all zeros → grid index 0 → IQ2XS_GRID[0] = 0x0808080808080808
+        // sign index 0 → KSIGNS_IQ2XS[0] = 0 → all positive
+        // scales all zeros → scale nibble 0 → db = 1.0 * (0.5 + 0) * 0.25 = 0.125
+        // Each element = 0.125 * 8 = 1.0, sum over 256 = 256.0
+
+        let x = vec![1.0f32; 256];
+        let y = matvec_iq2_xs_cpu(&block, &x, 1, 256);
+        assert!((y[0] - 256.0).abs() < 1.0, "IQ2_XS basic: got {}", y[0]);
+    }
+
+    #[test]
+    fn test_iq2_xs_with_scale() {
+        let mut block = vec![0u8; 74];
+        block[0] = 0x00;
+        block[1] = 0x3C; // d = 1.0
+                         // Set scale for groups 0&1: scales[0] = 0x5F → group 0 nibble = 15, group 1 nibble = 5
+        block[2 + 64] = 0x5F;
+        // db_group0 = 1.0 * (0.5 + 15) * 0.25 = 3.875
+        // db_group1 = 1.0 * (0.5 + 5) * 0.25 = 1.375
+        // Each element in group 0 = 3.875 * 8 = 31.0
+
+        let x = vec![1.0f32; 256];
+        let y = matvec_iq2_xs_cpu(&block, &x, 1, 256);
+        // Group 0: 32 * 31.0 = 992.0, Group 1: 32 * (1.375*8) = 352.0, Groups 2-7: 32 * (0.125*8) = 256
+        assert!(y[0] > 256.0, "IQ2_XS scale: got {}", y[0]);
+    }
+
+    #[test]
+    fn test_iq2_xs_grid_lookup() {
+        assert_eq!(IQ2XS_GRID[0], 0x0808080808080808);
+        assert_eq!(IQ2XS_GRID[511], 0x2b2b2b2b2b2b2b2b);
+        let bytes = IQ2XS_GRID[0].to_le_bytes();
+        assert!(bytes.iter().all(|&b| b == 0x08));
+    }
+
+    #[test]
+    fn test_iq2_xxs_dispatch() {
+        let block = vec![0u8; 66];
+        let x = vec![0.0f32; 256];
+        let y = matvec_quantized_cpu(&block, &x, 1, 256, GgmlType::IQ2XXS);
+        assert_eq!(y.len(), 1);
+        assert!((y[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_iq2_xs_dispatch() {
+        let block = vec![0u8; 74];
+        let x = vec![0.0f32; 256];
+        let y = matvec_quantized_cpu(&block, &x, 1, 256, GgmlType::IQ2XS);
+        assert_eq!(y.len(), 1);
+        assert!((y[0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_bf16_conversion() {
+        // BF16 for 1.0 = 0x3F80 (upper 16 bits of f32 1.0 = 0x3F800000)
+        assert!((bf16_to_f32(0x80, 0x3F) - 1.0).abs() < 1e-6);
+        // BF16 for -2.0 = 0xC000
+        assert!((bf16_to_f32(0x00, 0xC0) - (-2.0)).abs() < 1e-6);
+        // BF16 for 0.0 = 0x0000
+        assert!((bf16_to_f32(0x00, 0x00) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_matvec_bf16_cpu() {
+        // 2x2 identity matrix in BF16
+        // 1.0 BF16 = 0x3F80, 0.0 BF16 = 0x0000
+        let w: Vec<u8> = vec![
+            0x80, 0x3F, 0x00, 0x00, // row 0: [1.0, 0.0]
+            0x00, 0x00, 0x80, 0x3F, // row 1: [0.0, 1.0]
+        ];
+        let x = vec![3.0, 7.0];
+        let y = matvec_bf16_cpu(&w, &x, 2, 2);
+        assert!((y[0] - 3.0).abs() < 1e-2);
+        assert!((y[1] - 7.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_matvec_bf16_dispatch() {
+        // Test through the dispatch path
+        let w: Vec<u8> = vec![
+            0x80, 0x3F, 0x00, 0x40, // row 0: [1.0, 2.0]
+            0x40, 0x40, 0x80, 0x40, // row 1: [3.0, 4.0]
+        ];
+        let x = vec![1.0, 1.0];
+        let y = matvec_quantized_cpu(&w, &x, 2, 2, GgmlType::BF16);
+        assert!((y[0] - 3.0).abs() < 1e-2);
+        assert!((y[1] - 7.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_matvec_f16_cpu() {
+        // 2x2 identity matrix in F16
+        // 1.0 F16 = 0x3C00, 0.0 F16 = 0x0000
+        let w: Vec<u8> = vec![
+            0x00, 0x3C, 0x00, 0x00, // row 0: [1.0, 0.0]
+            0x00, 0x00, 0x00, 0x3C, // row 1: [0.0, 1.0]
+        ];
+        let x = vec![5.0, 9.0];
+        let y = matvec_f16_cpu(&w, &x, 2, 2);
+        assert!((y[0] - 5.0).abs() < 1e-2);
+        assert!((y[1] - 9.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_matvec_f16_dispatch() {
+        let w: Vec<u8> = vec![
+            0x00, 0x3C, 0x00, 0x40, // row 0: [1.0, 2.0]
+            0x00, 0x42, 0x00, 0x44, // row 1: [3.0, 4.0]
+        ];
+        let x = vec![1.0, 1.0];
+        let y = matvec_quantized_cpu(&w, &x, 2, 2, GgmlType::F16);
+        assert!((y[0] - 3.0).abs() < 1e-2);
+        assert!((y[1] - 7.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_metal_shader_compilation() {
+        // Only on macOS
+        if MetalCompute::is_available() {
+            let metal = MetalCompute::new().unwrap();
+            assert!(
+                metal.shader_library_path().is_some(),
+                "Metal shaders should compile on macOS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_residual_rmsnorm_basic() {
+        // x = [1, 2, 3], residual = [1, 1, 1] → x_new = [2, 3, 4]
+        // rms = sqrt((4+9+16)/3) = sqrt(29/3) ≈ 3.109
+        // weight = [1, 1, 1] → output = x_new / rms
+        let mut x = vec![1.0f32, 2.0, 3.0];
+        let residual = vec![1.0f32, 1.0, 1.0];
+        let weight = vec![1.0f32, 1.0, 1.0];
+        fused_residual_rmsnorm_f32(&mut x, &residual, &weight, 1e-5);
+
+        let expected_rms = ((4.0 + 9.0 + 16.0) / 3.0f32 + 1e-5).sqrt();
+        let inv = 1.0 / expected_rms;
+        assert!((x[0] - 2.0 * inv).abs() < 1e-5);
+        assert!((x[1] - 3.0 * inv).abs() < 1e-5);
+        assert!((x[2] - 4.0 * inv).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_fused_residual_rmsnorm_matches_separate() {
+        // Verify fused gives same result as separate add + rmsnorm
+        let x_orig = vec![0.5f32, -1.2, 3.7, 0.1, -2.5, 1.8, 0.3, -0.9];
+        let residual = vec![0.1f32, 0.3, -0.5, 1.0, 0.2, -0.4, 0.8, 0.6];
+        let weight = vec![1.0f32, 0.5, 2.0, 1.5, 0.8, 1.2, 0.3, 1.7];
+        let eps = 1e-5;
+
+        // Separate path
+        let mut x_sep = x_orig.clone();
+        for (i, v) in x_sep.iter_mut().enumerate() {
+            *v += residual[i];
+        }
+        rmsnorm_f32_fast_scalar(&mut x_sep, &weight, eps);
+
+        // Fused path
+        let mut x_fused = x_orig;
+        fused_residual_rmsnorm_f32(&mut x_fused, &residual, &weight, eps);
+
+        for (a, b) in x_sep.iter().zip(x_fused.iter()) {
+            assert!((a - b).abs() < 1e-5, "mismatch: separate={a}, fused={b}");
+        }
+    }
+
+    #[test]
+    fn test_fused_residual_rmsnorm_zero_residual() {
+        // With zero residual, should match plain rmsnorm
+        let mut x_plain = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut x_fused = x_plain.clone();
+        let weight = vec![1.0f32; 4];
+        let residual = vec![0.0f32; 4];
+        let eps = 1e-5;
+
+        rmsnorm_f32_fast_scalar(&mut x_plain, &weight, eps);
+        fused_residual_rmsnorm_f32(&mut x_fused, &residual, &weight, eps);
+
+        for (a, b) in x_plain.iter().zip(x_fused.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_fused_qkv_cpu_basic() {
+        // 2x3 identity-ish weights, 3-dim input
+        let n_embd = 3;
+        let q_dim = 2;
+        let kv_dim = 2;
+        let wq = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0]; // picks x[0], x[1]
+        let wk = vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0]; // picks x[1], x[2]
+        let wv = vec![1.0, 1.0, 0.0, 0.0, 1.0, 1.0]; // x[0]+x[1], x[1]+x[2]
+        let x = vec![2.0, 3.0, 5.0];
+
+        let (q, k, v) = fused_qkv_f32_cpu(&wq, &wk, &wv, &x, q_dim, kv_dim, n_embd);
+        assert!((q[0] - 2.0).abs() < 1e-6);
+        assert!((q[1] - 3.0).abs() < 1e-6);
+        assert!((k[0] - 3.0).abs() < 1e-6);
+        assert!((k[1] - 5.0).abs() < 1e-6);
+        assert!((v[0] - 5.0).abs() < 1e-6);
+        assert!((v[1] - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_fused_qkv_matches_separate() {
+        // Verify fused CPU path matches 3 separate matvecs
+        let n_embd = 16;
+        let q_dim = 8;
+        let kv_dim = 4;
+        let wq: Vec<f32> = (0..q_dim * n_embd)
+            .map(|i| (i % 11) as f32 * 0.1 - 0.5)
+            .collect();
+        let wk: Vec<f32> = (0..kv_dim * n_embd)
+            .map(|i| (i % 7) as f32 * 0.15 - 0.3)
+            .collect();
+        let wv: Vec<f32> = (0..kv_dim * n_embd)
+            .map(|i| (i % 13) as f32 * 0.08 - 0.4)
+            .collect();
+        let x: Vec<f32> = (0..n_embd).map(|i| (i % 5) as f32 * 0.3 - 0.6).collect();
+
+        let q_sep = matvec_f32_simd(&wq, &x, q_dim, n_embd);
+        let k_sep = matvec_f32_simd(&wk, &x, kv_dim, n_embd);
+        let v_sep = matvec_f32_simd(&wv, &x, kv_dim, n_embd);
+
+        let (q_fused, k_fused, v_fused) =
+            fused_qkv_f32_cpu(&wq, &wk, &wv, &x, q_dim, kv_dim, n_embd);
+
+        for i in 0..q_dim {
+            assert!((q_sep[i] - q_fused[i]).abs() < 1e-4, "Q mismatch at {i}");
+        }
+        for i in 0..kv_dim {
+            assert!((k_sep[i] - k_fused[i]).abs() < 1e-4, "K mismatch at {i}");
+            assert!((v_sep[i] - v_fused[i]).abs() < 1e-4, "V mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn test_fused_qkv_gpu_matches_cpu() {
+        let gpu = MetalGpu::new();
+        if gpu.is_none() {
+            return; // skip on non-macOS
+        }
+        let gpu = gpu.unwrap();
+
+        let n_embd = 32;
+        let q_dim = 16;
+        let kv_dim = 8;
+        let wq: Vec<f32> = (0..q_dim * n_embd)
+            .map(|i| (i % 11) as f32 * 0.1 - 0.5)
+            .collect();
+        let wk: Vec<f32> = (0..kv_dim * n_embd)
+            .map(|i| (i % 7) as f32 * 0.15 - 0.3)
+            .collect();
+        let wv: Vec<f32> = (0..kv_dim * n_embd)
+            .map(|i| (i % 13) as f32 * 0.08 - 0.4)
+            .collect();
+        let x: Vec<f32> = (0..n_embd).map(|i| (i % 5) as f32 * 0.3 - 0.6).collect();
+
+        let (q_cpu, k_cpu, v_cpu) = fused_qkv_f32_cpu(&wq, &wk, &wv, &x, q_dim, kv_dim, n_embd);
+        let (q_gpu, k_gpu, v_gpu) = gpu.fused_qkv_f32(&wq, &wk, &wv, &x, q_dim, kv_dim, n_embd);
+
+        for i in 0..q_dim {
+            assert!(
+                (q_cpu[i] - q_gpu[i]).abs() < 1e-4,
+                "Q gpu mismatch at {i}: cpu={}, gpu={}",
+                q_cpu[i],
+                q_gpu[i]
+            );
+        }
+        for i in 0..kv_dim {
+            assert!((k_cpu[i] - k_gpu[i]).abs() < 1e-4, "K gpu mismatch at {i}");
+            assert!((v_cpu[i] - v_gpu[i]).abs() < 1e-4, "V gpu mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn test_fused_qkv_metal_compute_dispatch() {
+        // Test via MetalCompute wrapper (integration)
+        let mc = MetalCompute::new();
+        if mc.is_none() {
+            return;
+        }
+        let mc = mc.unwrap();
+
+        let n_embd = 16;
+        let q_dim = 8;
+        let kv_dim = 4;
+        let wq: Vec<f32> = (0..q_dim * n_embd).map(|i| (i % 9) as f32 * 0.12).collect();
+        let wk: Vec<f32> = (0..kv_dim * n_embd).map(|i| (i % 5) as f32 * 0.2).collect();
+        let wv: Vec<f32> = (0..kv_dim * n_embd)
+            .map(|i| (i % 7) as f32 * 0.15)
+            .collect();
+        let x: Vec<f32> = (0..n_embd).map(|i| i as f32 * 0.1).collect();
+
+        let (q, k, v) = mc.fused_qkv_f32(&wq, &wk, &wv, &x, q_dim, kv_dim, n_embd);
+        assert_eq!(q.len(), q_dim);
+        assert_eq!(k.len(), kv_dim);
+        assert_eq!(v.len(), kv_dim);
+
+        // Cross-check with separate matvecs
+        let q_ref = matvec_f32_simd(&wq, &x, q_dim, n_embd);
+        for i in 0..q_dim {
+            assert!(
+                (q[i] - q_ref[i]).abs() < 1e-4,
+                "MetalCompute QKV Q mismatch at {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_residual_rmsnorm_gpu_matches_cpu() {
+        // If Metal GPU is available, verify GPU path matches CPU
+        let gpu = MetalGpu::new();
+        if gpu.is_none() {
+            return; // skip on non-macOS
+        }
+        let gpu = gpu.unwrap();
+
+        let x_orig = vec![0.5f32, -1.2, 3.7, 0.1, -2.5, 1.8, 0.3, -0.9];
+        let residual = vec![0.1f32, 0.3, -0.5, 1.0, 0.2, -0.4, 0.8, 0.6];
+        let weight = vec![1.0f32, 0.5, 2.0, 1.5, 0.8, 1.2, 0.3, 1.7];
+        let eps = 1e-5;
+
+        // CPU path
+        let mut x_cpu = x_orig.clone();
+        fused_residual_rmsnorm_f32(&mut x_cpu, &residual, &weight, eps);
+
+        // GPU path
+        let mut x_gpu = x_orig;
+        gpu.fused_residual_rmsnorm_f32(&mut x_gpu, &residual, &weight, eps);
+
+        for (i, (a, b)) in x_cpu.iter().zip(x_gpu.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "index {i}: cpu={a}, gpu={b}");
+        }
+    }
+
+    #[test]
+    fn test_rope_multi_head_matches_single_head() {
+        let head_dim = 4;
+        let n_heads = 3;
+        let position = 7;
+        let theta = 10000.0f32;
+
+        let mut x: Vec<f32> = (0..n_heads * head_dim)
+            .map(|i| (i as f32 + 1.0) * 0.5)
+            .collect();
+        let orig = x.clone();
+
+        rope_f32_multi_head(&mut x, head_dim, n_heads, position, theta);
+
+        // Verify each head independently
+        for h in 0..n_heads {
+            let base = h * head_dim;
+            for i in 0..head_dim / 2 {
+                let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+                let angle = position as f32 * freq;
+                let (sin_val, cos_val) = angle.sin_cos();
+                let x0 = orig[base + i * 2];
+                let x1 = orig[base + i * 2 + 1];
+                let expected0 = x0 * cos_val - x1 * sin_val;
+                let expected1 = x0 * sin_val + x1 * cos_val;
+                assert!(
+                    (x[base + i * 2] - expected0).abs() < 1e-5,
+                    "head {h} pair {i}: got {} expected {}",
+                    x[base + i * 2],
+                    expected0
+                );
+                assert!((x[base + i * 2 + 1] - expected1).abs() < 1e-5,);
+            }
+        }
+    }
+
+    #[test]
+    fn test_rope_multi_head_position_zero() {
+        let head_dim = 4;
+        let n_heads = 2;
+        let mut x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let orig = x.clone();
+        rope_f32_multi_head(&mut x, head_dim, n_heads, 0, 10000.0);
+        for i in 0..x.len() {
+            assert!(
+                (x[i] - orig[i]).abs() < 1e-6,
+                "Position 0 should be identity"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_qkv_rope_cpu_basic() {
+        let n_embd = 4;
+        let q_dim = 4;
+        let kv_dim = 4;
+        let head_dim = 4;
+
+        let x = vec![1.0f32; n_embd];
+        let w = vec![0.1f32; n_embd * n_embd]; // identity-ish
+
+        let (q, k, v) =
+            fused_qkv_rope_f32_cpu(&w, &w, &w, &x, q_dim, kv_dim, n_embd, head_dim, 0, 10000.0);
+
+        // At position 0, RoPE is identity, so q == k == v == plain matvec
+        let plain = matvec_f32_simd(&w, &x, q_dim, n_embd);
+        for i in 0..q_dim {
+            assert!((q[i] - plain[i]).abs() < 1e-6);
+            assert!((k[i] - plain[i]).abs() < 1e-6);
+            assert!((v[i] - plain[i]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_fused_qkv_rope_gpu_matches_cpu() {
+        let gpu = MetalGpu::new();
+        if gpu.is_none() {
+            return;
+        }
+        let gpu = gpu.unwrap();
+
+        let n_embd = 128;
+        let n_head = 4;
+        let n_head_kv = 2;
+        let head_dim = 32;
+        let q_dim = n_head * head_dim;
+        let kv_dim = n_head_kv * head_dim;
+        let position = 10;
+        let theta = 10000.0f32;
+
+        let x: Vec<f32> = (0..n_embd).map(|i| (i as f32 * 0.03).sin()).collect();
+        let wq: Vec<f32> = (0..q_dim * n_embd)
+            .map(|i| ((i * 7 + 3) as f32 % 13.0 - 6.0) * 0.01)
+            .collect();
+        let wk: Vec<f32> = (0..kv_dim * n_embd)
+            .map(|i| ((i * 11 + 5) as f32 % 13.0 - 6.0) * 0.01)
+            .collect();
+        let wv: Vec<f32> = (0..kv_dim * n_embd)
+            .map(|i| ((i * 13 + 7) as f32 % 13.0 - 6.0) * 0.01)
+            .collect();
+
+        let (q_cpu, k_cpu, v_cpu) = fused_qkv_rope_f32_cpu(
+            &wq, &wk, &wv, &x, q_dim, kv_dim, n_embd, head_dim, position, theta,
+        );
+        let (q_gpu, k_gpu, v_gpu) = gpu.fused_qkv_rope_f32(
+            &wq, &wk, &wv, &x, q_dim, kv_dim, n_embd, head_dim, position, theta,
+        );
+
+        for i in 0..q_dim {
+            assert!(
+                (q_cpu[i] - q_gpu[i]).abs() < 0.02,
+                "Q at {i}: cpu={} gpu={}",
+                q_cpu[i],
+                q_gpu[i]
+            );
+        }
+        for i in 0..kv_dim {
+            assert!(
+                (k_cpu[i] - k_gpu[i]).abs() < 0.02,
+                "K at {i}: cpu={} gpu={}",
+                k_cpu[i],
+                k_gpu[i]
+            );
+        }
+        for i in 0..kv_dim {
+            assert!(
+                (v_cpu[i] - v_gpu[i]).abs() < 0.02,
+                "V at {i}: cpu={} gpu={}",
+                v_cpu[i],
+                v_gpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_rmsnorm_linear_cpu_basic() {
+        let n_embd = 8;
+        let vocab_size = 4;
+        let x: Vec<f32> = (0..n_embd).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let norm_weight: Vec<f32> = vec![1.0; n_embd];
+        // Simple identity-ish output weight
+        let mut out_weight = vec![0.0f32; vocab_size * n_embd];
+        for r in 0..vocab_size {
+            out_weight[r * n_embd + r] = 1.0;
+        }
+
+        let logits =
+            fused_rmsnorm_linear_f32_cpu(&x, &norm_weight, &out_weight, vocab_size, n_embd);
+        assert_eq!(logits.len(), vocab_size);
+
+        // Compare with separate norm + matvec
+        let mut x_norm = x.clone();
+        rmsnorm_f32_fast(&mut x_norm, &norm_weight, 1e-5);
+        let expected = matvec_f32_simd(&out_weight, &x_norm, vocab_size, n_embd);
+        for i in 0..vocab_size {
+            assert!(
+                (logits[i] - expected[i]).abs() < 1e-5,
+                "logit {i}: fused={} expected={}",
+                logits[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_rmsnorm_linear_cpu_matches_separate() {
+        let n_embd = 64;
+        let vocab_size = 32;
+        let x: Vec<f32> = (0..n_embd)
+            .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.5)
+            .collect();
+        let norm_weight: Vec<f32> = (0..n_embd).map(|i| 0.5 + (i % 5) as f32 * 0.2).collect();
+        let out_weight: Vec<f32> = (0..vocab_size * n_embd)
+            .map(|i| ((i * 11 + 7) % 19) as f32 * 0.05 - 0.4)
+            .collect();
+
+        let fused = fused_rmsnorm_linear_f32_cpu(&x, &norm_weight, &out_weight, vocab_size, n_embd);
+
+        // Separate path
+        let mut x_norm = x.clone();
+        rmsnorm_f32_fast(&mut x_norm, &norm_weight, 1e-5);
+        let separate = matvec_f32_simd(&out_weight, &x_norm, vocab_size, n_embd);
+
+        for i in 0..vocab_size {
+            assert!(
+                (fused[i] - separate[i]).abs() < 1e-4,
+                "logit {i}: fused={} separate={}",
+                fused[i],
+                separate[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_post_attn_norm_cpu_basic() {
+        let n = 64;
+        let mut hidden: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+        let attn: Vec<f32> = (0..n).map(|i| (n - i) as f32 * 0.05).collect();
+        let weight: Vec<f32> = (0..n).map(|i| 0.8 + (i % 3) as f32 * 0.1).collect();
+
+        let ffn_input = fused_post_attn_norm_f32_cpu(&mut hidden, &attn, &weight, 1e-5);
+
+        // Verify residual was applied
+        for i in 0..n {
+            let expected = i as f32 * 0.1 + (n - i) as f32 * 0.05;
+            assert!(
+                (hidden[i] - expected).abs() < 1e-6,
+                "hidden[{i}]: got={} expected={}",
+                hidden[i],
+                expected
+            );
+        }
+
+        // Verify normalization
+        assert_eq!(ffn_input.len(), n);
+        let sum_sq: f32 = hidden.iter().map(|x| x * x).sum();
+        let inv_rms = 1.0 / (sum_sq / n as f32 + 1e-5).sqrt();
+        for i in 0..n {
+            let expected = hidden[i] * inv_rms * weight[i];
+            assert!(
+                (ffn_input[i] - expected).abs() < 1e-5,
+                "ffn[{i}]: got={} expected={}",
+                ffn_input[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_post_attn_norm_cpu_matches_separate() {
+        let n = 128;
+        let hidden_orig: Vec<f32> = (0..n)
+            .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.5)
+            .collect();
+        let attn: Vec<f32> = (0..n)
+            .map(|i| ((i * 11 + 5) % 17) as f32 * 0.08 - 0.3)
+            .collect();
+        let weight: Vec<f32> = (0..n).map(|i| 0.5 + (i % 5) as f32 * 0.2).collect();
+
+        // Fused path
+        let mut hidden_fused = hidden_orig.clone();
+        let ffn_fused = fused_post_attn_norm_f32_cpu(&mut hidden_fused, &attn, &weight, 1e-5);
+
+        // Separate path
+        let mut hidden_sep = hidden_orig.clone();
+        for i in 0..n {
+            hidden_sep[i] += attn[i];
+        }
+        let mut ffn_sep = hidden_sep.clone();
+        rmsnorm_f32_fast(&mut ffn_sep, &weight, 1e-5);
+
+        for i in 0..n {
+            assert!(
+                (hidden_fused[i] - hidden_sep[i]).abs() < 1e-6,
+                "hidden[{i}]: fused={} separate={}",
+                hidden_fused[i],
+                hidden_sep[i]
+            );
+            assert!(
+                (ffn_fused[i] - ffn_sep[i]).abs() < 1e-5,
+                "ffn[{i}]: fused={} separate={}",
+                ffn_fused[i],
+                ffn_sep[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_post_attn_norm_gpu_matches_cpu() {
+        let gpu = match crate::metal::gpu::MetalGpu::new() {
+            Some(g) => g,
+            None => return,
+        };
+
+        let n = 256;
+        let hidden_orig: Vec<f32> = (0..n)
+            .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.5)
+            .collect();
+        let attn: Vec<f32> = (0..n)
+            .map(|i| ((i * 11 + 5) % 17) as f32 * 0.08 - 0.3)
+            .collect();
+        let weight: Vec<f32> = (0..n).map(|i| 0.5 + (i % 5) as f32 * 0.2).collect();
+
+        // CPU
+        let mut hidden_cpu = hidden_orig.clone();
+        let ffn_cpu = fused_post_attn_norm_f32_cpu(&mut hidden_cpu, &attn, &weight, 1e-5);
+
+        // GPU
+        let mut hidden_gpu = hidden_orig.clone();
+        let ffn_gpu = gpu.fused_post_attn_norm_f32(&mut hidden_gpu, &attn, &weight, 1e-5);
+
+        for i in 0..n {
+            assert!(
+                (hidden_cpu[i] - hidden_gpu[i]).abs() < 0.01,
+                "hidden[{i}]: cpu={} gpu={}",
+                hidden_cpu[i],
+                hidden_gpu[i]
+            );
+            assert!(
+                (ffn_cpu[i] - ffn_gpu[i]).abs() < 0.01,
+                "ffn[{i}]: cpu={} gpu={}",
+                ffn_cpu[i],
+                ffn_gpu[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_post_attn_norm_metal_compute() {
+        let mc = match MetalCompute::new() {
+            Some(m) => m,
+            None => return,
+        };
+        let n = 128;
+        let hidden_orig: Vec<f32> = (0..n)
+            .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.5)
+            .collect();
+        let attn: Vec<f32> = (0..n)
+            .map(|i| ((i * 11 + 5) % 17) as f32 * 0.08 - 0.3)
+            .collect();
+        let weight: Vec<f32> = (0..n).map(|i| 0.5 + (i % 5) as f32 * 0.2).collect();
+
+        // CPU reference
+        let mut hidden_cpu = hidden_orig.clone();
+        let ffn_cpu = fused_post_attn_norm_f32_cpu(&mut hidden_cpu, &attn, &weight, 1e-5);
+
+        // MetalCompute path
+        let mut hidden_mc = hidden_orig.clone();
+        let ffn_mc = mc.fused_post_attn_norm_f32(&mut hidden_mc, &attn, &weight, 1e-5);
+
+        for i in 0..n {
+            assert!(
+                (hidden_cpu[i] - hidden_mc[i]).abs() < 0.01,
+                "hidden[{i}]: cpu={} mc={}",
+                hidden_cpu[i],
+                hidden_mc[i]
+            );
+            assert!(
+                (ffn_cpu[i] - ffn_mc[i]).abs() < 0.01,
+                "ffn[{i}]: cpu={} mc={}",
+                ffn_cpu[i],
+                ffn_mc[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_rmsnorm_linear_gpu_matches_cpu() {
+        let gpu = match crate::metal::gpu::MetalGpu::new() {
+            Some(g) => g,
+            None => return, // Skip on non-macOS
+        };
+
+        let n_embd = 128;
+        let vocab_size = 64;
+        let x: Vec<f32> = (0..n_embd)
+            .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.5)
+            .collect();
+        let norm_weight: Vec<f32> = (0..n_embd).map(|i| 0.5 + (i % 5) as f32 * 0.2).collect();
+        let out_weight: Vec<f32> = (0..vocab_size * n_embd)
+            .map(|i| ((i * 11 + 7) % 19) as f32 * 0.05 - 0.4)
+            .collect();
+
+        let cpu_result =
+            fused_rmsnorm_linear_f32_cpu(&x, &norm_weight, &out_weight, vocab_size, n_embd);
+        let gpu_result =
+            gpu.fused_rmsnorm_linear_f32(&x, &norm_weight, &out_weight, vocab_size, n_embd);
+
+        assert_eq!(cpu_result.len(), gpu_result.len());
+        for i in 0..vocab_size {
+            assert!(
+                (cpu_result[i] - gpu_result[i]).abs() < 0.02,
+                "logit {i}: cpu={} gpu={}",
+                cpu_result[i],
+                gpu_result[i]
+            );
+        }
+    }
+}

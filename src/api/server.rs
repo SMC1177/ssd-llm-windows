@@ -1,0 +1,1340 @@
+//! Ollama-compatible HTTP API server
+//!
+//! v1.14: Ollama /api/embed endpoint for embeddings.
+//! v1.13: Full Ollama model management API (show/pull/copy/delete/ps).
+//! v0.4: Added streaming responses (chunked transfer encoding).
+//! Implements the Ollama REST API for drop-in compatibility:
+//! - POST /api/generate — text generation (streaming + non-streaming)
+//! - POST /api/chat — chat completions (streaming + non-streaming)
+//! - POST /api/show — model information and metadata
+//! - POST /api/pull — download models from HuggingFace Hub
+//! - POST /api/copy — copy/alias a local model
+//! - DELETE /api/delete — remove a local model
+//! - GET /api/tags — list loaded models
+//! - GET /api/ps — running model process status
+//! - GET /api/version — server version
+//! - POST /v1/chat/completions — OpenAI-compatible endpoint (streaming SSE)
+
+use crate::inference::transformer::{self, InferenceConfig};
+use crate::model::cache::LayerCache;
+use crate::model::gguf::GgufFile;
+use crate::ssd::streamer::SsdStreamer;
+use anyhow::Result;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tracing::{error, info, warn};
+
+/// Server configuration
+pub struct ServerConfig {
+    pub host: String,
+    pub port: u16,
+    pub model_path: PathBuf,
+    pub memory_budget: usize,
+    pub draft_model_path: Option<PathBuf>,
+    pub draft_ahead: usize,
+    pub adaptive_draft: bool,
+    pub prompt_cache: bool,
+    pub max_batch: usize,
+    pub tensor_parallel: usize,
+    pub paged_kv: bool,
+    pub paged_kv_blocks: usize,
+    pub paged_block_size: usize,
+    pub swap_quantize: bool,
+    pub adaptive_pin: usize,
+    /// Directory for persistent prompt cache files (empty = disabled)
+    pub prompt_cache_dir: Option<PathBuf>,
+}
+
+/// Model context shared across requests
+struct ModelContext {
+    gguf: GgufFile,
+    streamer: SsdStreamer,
+    cache: LayerCache,
+    model_name: String,
+    model_path: PathBuf,
+    adaptive_pinner: Option<crate::model::cache::AdaptiveLayerPinner>,
+}
+
+/// The API server
+pub struct ApiServer {
+    config: ServerConfig,
+}
+
+impl ApiServer {
+    pub fn new(config: ServerConfig) -> Self {
+        Self { config }
+    }
+
+    /// Start listening and handling requests
+    pub fn run(&self) -> Result<()> {
+        let addr = format!("{}:{}", self.config.host, self.config.port);
+        let listener = TcpListener::bind(&addr)?;
+        info!("ssd-llm API server listening on http://{}", addr);
+        info!("Ollama-compatible API: POST /api/generate, /api/chat, /api/embed, /api/show, /api/pull, /api/copy, DELETE /api/delete, GET /api/tags, /api/ps");
+        info!(
+            "OpenAI-compatible API: POST /v1/chat/completions, POST /v1/embeddings, GET /v1/models"
+        );
+        info!("Streaming: supported (default for generate/chat)");
+
+        // Load model
+        info!("Loading model: {}", self.config.model_path.display());
+        let gguf = GgufFile::open(&self.config.model_path)?;
+        let streamer = SsdStreamer::new(&self.config.model_path, self.config.memory_budget)?;
+        let cache = LayerCache::new(self.config.memory_budget);
+
+        let model_name = self
+            .config
+            .model_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        info!(
+            "Model loaded: {} ({} layers, {} embd, {} vocab)",
+            model_name,
+            gguf.n_layers(),
+            gguf.n_embd(),
+            gguf.vocab_size()
+        );
+
+        let adaptive_pinner = if self.config.adaptive_pin > 0 {
+            Some(crate::model::cache::AdaptiveLayerPinner::new(
+                self.config.adaptive_pin,
+                10, // minimum 10 accesses before eligible for pinning
+            ))
+        } else {
+            None
+        };
+
+        let ctx = Arc::new(Mutex::new(ModelContext {
+            gguf,
+            streamer,
+            cache,
+            model_name,
+            model_path: self.config.model_path.clone(),
+            adaptive_pinner,
+        }));
+
+        // Persistent prompt cache: load from disk on startup
+        let prompt_cache_path = self.config.prompt_cache_dir.as_ref().map(|dir| {
+            let _ = std::fs::create_dir_all(dir);
+            dir.join("prompt_cache.bin")
+        });
+        let prompt_cache_state = if self.config.prompt_cache {
+            let mut pc = crate::inference::prompt_cache::PromptCache::new(256 * 1024 * 1024);
+            if let Some(ref path) = prompt_cache_path {
+                match pc.load_from_disk(path) {
+                    Ok(n) if n > 0 => info!("Restored {} prompt cache entries from disk", n),
+                    Ok(_) => {}
+                    Err(e) => warn!("Failed to load prompt cache from disk: {}", e),
+                }
+            }
+            Some(Arc::new(Mutex::new(pc)))
+        } else {
+            None
+        };
+
+        // Graceful shutdown via SIGINT/SIGTERM
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+
+        // Set up signal handler
+        ctrlc_register(move || {
+            warn!("Shutdown signal received, stopping server...");
+            shutdown_clone.store(true, Ordering::SeqCst);
+        });
+
+        // Set non-blocking so we can check shutdown flag
+        listener.set_nonblocking(true)?;
+
+        info!("Server ready. Press Ctrl+C to stop.");
+
+        while !shutdown.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    let ctx = Arc::clone(&ctx);
+                    if let Err(e) = handle_connection(stream, &ctx) {
+                        error!("Request error: {}", e);
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => error!("Accept error: {}", e),
+            }
+        }
+
+        // Persistent prompt cache: save to disk on shutdown
+        if let (Some(ref pc), Some(ref path)) = (&prompt_cache_state, &prompt_cache_path) {
+            let pc = pc.lock().unwrap();
+            match pc.save_to_disk(path) {
+                Ok(n) if n > 0 => info!("Saved {} prompt cache entries to disk", n),
+                Ok(_) => {}
+                Err(e) => warn!("Failed to save prompt cache to disk: {}", e),
+            }
+        }
+
+        info!("Server stopped gracefully.");
+        Ok(())
+    }
+}
+
+/// Register a ctrl-c handler (simplified, no external crate)
+fn ctrlc_register<F: FnOnce() + Send + 'static>(handler: F) {
+    let handler = std::sync::Mutex::new(Some(handler));
+    unsafe {
+        libc::signal(libc::SIGINT, (signal_handler as *const ()) as usize);
+        libc::signal(libc::SIGTERM, (signal_handler as *const ()) as usize);
+    }
+    // Store handler in a static
+    *SHUTDOWN_HANDLER.lock().unwrap() = Some(Box::new(move || {
+        if let Some(f) = handler.lock().unwrap().take() {
+            f();
+        }
+    }));
+}
+
+static SHUTDOWN_HANDLER: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+extern "C" fn signal_handler(_sig: libc::c_int) {
+    if let Some(handler) = SHUTDOWN_HANDLER.lock().unwrap().take() {
+        handler();
+    }
+}
+
+fn handle_connection(mut stream: TcpStream, ctx: &Arc<Mutex<ModelContext>>) -> Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return send_response(&mut stream, 400, "Bad Request");
+    }
+    let method = parts[0];
+    let path = parts[1];
+
+    // Read headers
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
+            content_length = val.trim().parse().unwrap_or(0);
+        }
+    }
+
+    // Read body
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+    let body_str = String::from_utf8_lossy(&body).to_string();
+
+    info!("{} {} (body: {} bytes)", method, path, content_length);
+
+    match (method, path) {
+        ("GET", "/api/tags") => handle_tags(&mut stream, ctx),
+        ("GET", "/api/version") => handle_version(&mut stream),
+        ("POST", "/api/generate") => handle_generate(&mut stream, ctx, &body_str),
+        ("POST", "/api/chat") => handle_chat(&mut stream, ctx, &body_str),
+        ("POST", "/api/show") => handle_show(&mut stream, ctx),
+        ("POST", "/api/pull") => handle_pull(&mut stream, &body_str),
+        ("POST", "/api/embed") => handle_ollama_embed(&mut stream, ctx, &body_str),
+        ("POST", "/api/copy") => handle_copy(&mut stream, &body_str),
+        ("DELETE", "/api/delete") => handle_api_delete(&mut stream, &body_str),
+        ("GET", "/api/ps") => handle_ps(&mut stream, ctx),
+        ("POST", "/v1/chat/completions") => handle_openai_chat(&mut stream, ctx, &body_str),
+        ("POST", "/v1/embeddings") => handle_embeddings(&mut stream, ctx, &body_str),
+        ("GET", "/v1/models") => handle_openai_models(&mut stream, ctx),
+        ("GET", "/health") => handle_health(&mut stream, ctx),
+        ("GET", "/metrics") => handle_metrics(&mut stream, ctx),
+        ("OPTIONS", _) => handle_cors_preflight(&mut stream),
+        ("GET", "/") => send_json_response(
+            &mut stream,
+            200,
+            &format!(r#"{{"status":"ssd-llm is running","version":"{}"}}"#, env!("CARGO_PKG_VERSION")),
+        ),
+        _ => send_response(&mut stream, 404, "Not Found"),
+    }
+}
+
+fn handle_tags(stream: &mut TcpStream, ctx: &Arc<Mutex<ModelContext>>) -> Result<()> {
+    let ctx = ctx.lock().unwrap();
+    let resp = format!(
+        r#"{{"models":[{{"name":"{}","size":{},"digest":"local","details":{{"family":"{}","parameter_size":"{}B","quantization_level":"local"}}}}]}}"#,
+        ctx.model_name,
+        ctx.gguf.file_size,
+        ctx.gguf.architecture(),
+        ctx.gguf.n_layers(),
+    );
+    send_json_response(stream, 200, &resp)
+}
+
+fn handle_show(stream: &mut TcpStream, ctx: &Arc<Mutex<ModelContext>>) -> Result<()> {
+    let ctx = ctx.lock().unwrap();
+    let info = crate::api::ollama_manage::model_info_from_gguf(
+        &ctx.gguf,
+        &ctx.model_name,
+        &ctx.model_path,
+    );
+    let json = crate::api::ollama_manage::model_info_to_json(&info);
+    send_json_response(stream, 200, &json)
+}
+
+/// Ollama-compatible /api/embed endpoint
+/// Accepts: {"model": "...", "input": "text"} or {"model": "...", "input": ["text1", "text2"]}
+fn handle_ollama_embed(
+    stream: &mut TcpStream,
+    ctx: &Arc<Mutex<ModelContext>>,
+    body: &str,
+) -> Result<()> {
+    // Extract input(s) — reuse the OpenAI input parser
+    let inputs = extract_embedding_inputs(body);
+    if inputs.is_empty() {
+        return send_json_response(
+            stream,
+            400,
+            r#"{"error":"'input' is required (string or array of strings)"}"#,
+        );
+    }
+
+    let mut ctx = ctx.lock().unwrap();
+    let ModelContext {
+        ref gguf,
+        ref streamer,
+        ref mut cache,
+        ref model_name,
+        ..
+    } = *ctx;
+
+    let mut embeddings = Vec::new();
+    let mut total_tokens = 0usize;
+
+    for input in &inputs {
+        match transformer::embed(gguf, streamer, cache, input, true) {
+            Ok(result) => {
+                total_tokens += result.prompt_tokens;
+                embeddings.push(
+                    result
+                        .embedding
+                        .iter()
+                        .map(|v| format!("{:.8}", v))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
+            Err(e) => {
+                let resp = format!(
+                    r#"{{"error":"embedding failed: {}"}}"#,
+                    escape_json(&e.to_string())
+                );
+                return send_json_response(stream, 500, &resp);
+            }
+        }
+    }
+
+    // Ollama format: {"model":"...","embeddings":[[...],[...]],...}
+    let emb_arrays: Vec<String> = embeddings.iter().map(|e| format!("[{}]", e)).collect();
+    let resp = format!(
+        r#"{{"model":"{}","embeddings":[{}],"total_duration":0,"load_duration":0,"prompt_eval_count":{}}}"#,
+        model_name,
+        emb_arrays.join(","),
+        total_tokens,
+    );
+    send_json_response(stream, 200, &resp)
+}
+
+fn handle_pull(stream: &mut TcpStream, body: &str) -> Result<()> {
+    let model_dir = crate::pull::default_model_dir();
+    let result = crate::api::ollama_manage::handle_pull(body, &model_dir);
+    let (status, json) = result.to_json();
+    send_json_response(stream, status, &json)
+}
+
+fn handle_copy(stream: &mut TcpStream, body: &str) -> Result<()> {
+    let model_dir = crate::pull::default_model_dir();
+    let (status, json) = crate::api::ollama_manage::handle_copy(body, &model_dir);
+    send_json_response(stream, status, &json)
+}
+
+fn handle_api_delete(stream: &mut TcpStream, body: &str) -> Result<()> {
+    let model_dir = crate::pull::default_model_dir();
+    let (status, json) = crate::api::ollama_manage::handle_delete(body, &model_dir);
+    send_json_response(stream, status, &json)
+}
+
+fn handle_ps(stream: &mut TcpStream, ctx: &Arc<Mutex<ModelContext>>) -> Result<()> {
+    let ctx = ctx.lock().unwrap();
+    let quantization = crate::api::ollama_manage::detect_quantization_pub(&ctx.gguf);
+    let json = crate::api::ollama_manage::running_model_json(
+        &ctx.model_name,
+        ctx.gguf.file_size,
+        &quantization,
+    );
+    send_json_response(stream, 200, &json)
+}
+
+fn handle_cors_preflight(stream: &mut TcpStream) -> Result<()> {
+    let resp = "HTTP/1.1 204 No Content\r\n\
+        Access-Control-Allow-Origin: *\r\n\
+        Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+        Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
+        Access-Control-Max-Age: 86400\r\n\
+        Content-Length: 0\r\n\
+        Connection: close\r\n\r\n";
+    stream.write_all(resp.as_bytes())?;
+    Ok(())
+}
+
+fn handle_version(stream: &mut TcpStream) -> Result<()> {
+    send_json_response(stream, 200, &format!(r#"{{"version":"{}-ssd-llm"}}"#, env!("CARGO_PKG_VERSION")))
+}
+
+fn handle_health(stream: &mut TcpStream, ctx: &Arc<Mutex<ModelContext>>) -> Result<()> {
+    let ctx = ctx.lock().unwrap();
+    let metrics = crate::api::metrics::MetricsCollector::new();
+    let json = metrics.health_json(&ctx.model_name, true);
+    send_json_response(stream, 200, &json)
+}
+
+fn handle_metrics(stream: &mut TcpStream, ctx: &Arc<Mutex<ModelContext>>) -> Result<()> {
+    let ctx = ctx.lock().unwrap();
+    let metrics = crate::api::metrics::MetricsCollector::new();
+    // Check Accept header for prometheus format (simplified — always return JSON for now)
+    let json = metrics.metrics_json(&ctx.model_name, 0);
+    send_json_response(stream, 200, &json)
+}
+
+fn handle_generate(
+    stream: &mut TcpStream,
+    ctx: &Arc<Mutex<ModelContext>>,
+    body: &str,
+) -> Result<()> {
+    let prompt = extract_json_string(body, "prompt").unwrap_or_default();
+    let max_tokens = extract_json_number(body, "num_predict").unwrap_or(128) as usize;
+    let temperature = extract_json_float(body, "temperature").unwrap_or(0.7);
+    let top_k = extract_json_number(body, "top_k").unwrap_or(40) as usize;
+    let top_p = extract_json_float(body, "top_p").unwrap_or(0.9);
+    let tfs_z = extract_json_float(body, "tfs_z").unwrap_or(0.0);
+    let mirostat = extract_json_number(body, "mirostat").unwrap_or(0) as u8;
+    let mirostat_tau = extract_json_float(body, "mirostat_tau").unwrap_or(5.0);
+    let mirostat_eta = extract_json_float(body, "mirostat_eta").unwrap_or(0.1);
+    let min_p = extract_json_float(body, "min_p").unwrap_or(0.0);
+    let repetition_penalty = extract_json_float(body, "repetition_penalty").unwrap_or(1.0);
+    let frequency_penalty = extract_json_float(body, "frequency_penalty").unwrap_or(0.0);
+    let presence_penalty = extract_json_float(body, "presence_penalty").unwrap_or(0.0);
+    let seed = extract_json_number(body, "seed").map(|n| n as u64);
+    let streaming = extract_json_bool(body, "stream").unwrap_or(true);
+
+    let config = InferenceConfig {
+        temperature,
+        top_k,
+        top_p,
+        max_tokens,
+        stop_sequences: Vec::new(),
+        repetition_penalty,
+        frequency_penalty,
+        presence_penalty,
+        tfs_z,
+        mirostat,
+        mirostat_tau,
+        mirostat_eta,
+        grammar: extract_json_string(body, "grammar").unwrap_or_default(),
+        min_p,
+        seed,
+    };
+
+    if streaming {
+        return handle_generate_streaming(stream, ctx, &prompt, &config);
+    }
+
+    let mut ctx = ctx.lock().unwrap();
+    let ModelContext {
+        ref gguf,
+        ref streamer,
+        ref mut cache,
+        ref model_name,
+        ..
+    } = *ctx;
+    let start = Instant::now();
+
+    match transformer::generate(gguf, streamer, cache, &prompt, &config) {
+        Ok(result) => {
+            let elapsed = start.elapsed();
+            let resp = format!(
+                r#"{{"model":"{}","created_at":"{}","response":"{}","done":true,"total_duration":{},"eval_count":{},"eval_duration":{}}}"#,
+                model_name,
+                chrono_now(),
+                escape_json(&result.text),
+                elapsed.as_nanos(),
+                result.token_count,
+                elapsed.as_nanos(),
+            );
+            send_json_response(stream, 200, &resp)
+        }
+        Err(e) => {
+            let resp = format!(r#"{{"error":"{}"}}"#, escape_json(&e.to_string()));
+            send_json_response(stream, 500, &resp)
+        }
+    }
+}
+
+/// Handle streaming generate — sends one JSON object per token via chunked transfer
+fn handle_generate_streaming(
+    stream: &mut TcpStream,
+    ctx: &Arc<Mutex<ModelContext>>,
+    prompt: &str,
+    config: &InferenceConfig,
+) -> Result<()> {
+    // Send chunked response header
+    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n")?;
+
+    let mut ctx = ctx.lock().unwrap();
+    let ModelContext {
+        ref gguf,
+        ref streamer,
+        ref mut cache,
+        ref model_name,
+        ..
+    } = *ctx;
+    let start = Instant::now();
+
+    // Use the streaming generator
+    match transformer::generate_streaming(gguf, streamer, cache, prompt, config) {
+        Ok(mut gen) => {
+            let mut total_tokens = 0usize;
+            while let Some(token_text) = gen.next_token()? {
+                total_tokens += 1;
+                let chunk = format!(
+                    r#"{{"model":"{}","created_at":"{}","response":"{}","done":false}}"#,
+                    model_name,
+                    chrono_now(),
+                    escape_json(&token_text),
+                );
+                write_chunk(stream, &chunk)?;
+                let _ = stream.flush();
+            }
+            // Final message
+            let elapsed = start.elapsed();
+            let final_chunk = format!(
+                r#"{{"model":"{}","created_at":"{}","response":"","done":true,"total_duration":{},"eval_count":{},"eval_duration":{}}}"#,
+                model_name,
+                chrono_now(),
+                elapsed.as_nanos(),
+                total_tokens,
+                elapsed.as_nanos(),
+            );
+            write_chunk(stream, &final_chunk)?;
+            write_chunk(stream, "")?; // empty chunk = end
+            Ok(())
+        }
+        Err(e) => {
+            let chunk = format!(
+                r#"{{"error":"{}","done":true}}"#,
+                escape_json(&e.to_string())
+            );
+            write_chunk(stream, &chunk)?;
+            write_chunk(stream, "")?;
+            Ok(())
+        }
+    }
+}
+
+fn handle_chat(stream: &mut TcpStream, ctx: &Arc<Mutex<ModelContext>>, body: &str) -> Result<()> {
+    let prompt = extract_last_message_content(body).unwrap_or_default();
+    let streaming = extract_json_bool(body, "stream").unwrap_or(true);
+
+    let config = InferenceConfig {
+        temperature: extract_json_float(body, "temperature").unwrap_or(0.7),
+        top_k: extract_json_number(body, "top_k").unwrap_or(40) as usize,
+        top_p: extract_json_float(body, "top_p").unwrap_or(0.9),
+        max_tokens: extract_json_number(body, "num_predict").unwrap_or(128) as usize,
+        stop_sequences: extract_json_string_array(body, "stop").unwrap_or_default(),
+        repetition_penalty: extract_json_float(body, "repeat_penalty").unwrap_or(1.0),
+        frequency_penalty: extract_json_float(body, "frequency_penalty").unwrap_or(0.0),
+        presence_penalty: extract_json_float(body, "presence_penalty").unwrap_or(0.0),
+        tfs_z: extract_json_float(body, "tfs_z").unwrap_or(0.0),
+        mirostat: extract_json_number(body, "mirostat").unwrap_or(0) as u8,
+        mirostat_tau: extract_json_float(body, "mirostat_tau").unwrap_or(5.0),
+        mirostat_eta: extract_json_float(body, "mirostat_eta").unwrap_or(0.1),
+        grammar: extract_json_string(body, "grammar").unwrap_or_default(),
+                    min_p: 0.0,
+                    seed: None,
+    };
+
+    if streaming {
+        return handle_chat_streaming(stream, ctx, &prompt, &config);
+    }
+
+    let mut ctx = ctx.lock().unwrap();
+    let ModelContext {
+        ref gguf,
+        ref streamer,
+        ref mut cache,
+        ref model_name,
+        ..
+    } = *ctx;
+    let start = Instant::now();
+
+    match transformer::generate(gguf, streamer, cache, &prompt, &config) {
+        Ok(result) => {
+            let elapsed = start.elapsed();
+            let resp = format!(
+                r#"{{"model":"{}","created_at":"{}","message":{{"role":"assistant","content":"{}"}},"done":true,"total_duration":{},"eval_count":{}}}"#,
+                model_name,
+                chrono_now(),
+                escape_json(&result.text),
+                elapsed.as_nanos(),
+                result.token_count,
+            );
+            send_json_response(stream, 200, &resp)
+        }
+        Err(e) => {
+            let resp = format!(r#"{{"error":"{}"}}"#, escape_json(&e.to_string()));
+            send_json_response(stream, 500, &resp)
+        }
+    }
+}
+
+/// Handle streaming chat — Ollama format
+fn handle_chat_streaming(
+    stream: &mut TcpStream,
+    ctx: &Arc<Mutex<ModelContext>>,
+    prompt: &str,
+    config: &InferenceConfig,
+) -> Result<()> {
+    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n")?;
+
+    let mut ctx = ctx.lock().unwrap();
+    let ModelContext {
+        ref gguf,
+        ref streamer,
+        ref mut cache,
+        ref model_name,
+        ..
+    } = *ctx;
+    let start = Instant::now();
+
+    match transformer::generate_streaming(gguf, streamer, cache, prompt, config) {
+        Ok(mut gen) => {
+            let mut total_tokens = 0usize;
+            while let Some(token_text) = gen.next_token()? {
+                total_tokens += 1;
+                let chunk = format!(
+                    r#"{{"model":"{}","created_at":"{}","message":{{"role":"assistant","content":"{}"}},"done":false}}"#,
+                    model_name,
+                    chrono_now(),
+                    escape_json(&token_text),
+                );
+                write_chunk(stream, &chunk)?;
+                let _ = stream.flush();
+            }
+            let elapsed = start.elapsed();
+            let final_chunk = format!(
+                r#"{{"model":"{}","created_at":"{}","message":{{"role":"assistant","content":""}},"done":true,"total_duration":{},"eval_count":{}}}"#,
+                model_name,
+                chrono_now(),
+                elapsed.as_nanos(),
+                total_tokens,
+            );
+            write_chunk(stream, &final_chunk)?;
+            write_chunk(stream, "")?;
+            Ok(())
+        }
+        Err(e) => {
+            let chunk = format!(
+                r#"{{"error":"{}","done":true}}"#,
+                escape_json(&e.to_string())
+            );
+            write_chunk(stream, &chunk)?;
+            write_chunk(stream, "")?;
+            Ok(())
+        }
+    }
+}
+
+fn handle_openai_chat(
+    stream: &mut TcpStream,
+    ctx: &Arc<Mutex<ModelContext>>,
+    body: &str,
+) -> Result<()> {
+    use crate::inference::chat_template::{format_chat, ChatTemplateFormat};
+    use crate::inference::tool_use::{
+        extract_tool_calls, format_tool_calls_response, format_tool_results, format_tools_prompt,
+        has_tool_calls, parse_tool_messages, parse_tools, validate_tool_call, ToolChoice,
+    };
+
+    // Parse tools and tool_choice if present
+    let tools_json = extract_json_value(body, "tools");
+    let tools = tools_json.as_ref().map(parse_tools).unwrap_or_default();
+    let tool_choice = extract_json_value(body, "tool_choice")
+        .as_ref()
+        .map(ToolChoice::from_json)
+        .unwrap_or(if tools.is_empty() {
+            ToolChoice::None
+        } else {
+            ToolChoice::Auto
+        });
+
+    // Parse all messages and format with appropriate chat template
+    let messages = extract_chat_messages(body);
+
+    // Parse tool result messages from the raw JSON
+    let raw_messages = extract_json_value(body, "messages");
+    let tool_results = raw_messages
+        .as_ref()
+        .map(parse_tool_messages)
+        .unwrap_or_default();
+
+    let prompt = if messages.is_empty() {
+        let base = extract_last_message_content(body).unwrap_or_default();
+        let tools_section = format_tools_prompt(&tools, &tool_choice);
+        let tool_results_section = if tool_results.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", format_tool_results(&tool_results))
+        };
+        format!("{}{}{}", base, tools_section, tool_results_section)
+    } else {
+        // Detect template from model name
+        let model_name = {
+            let ctx = ctx.lock().unwrap();
+            ctx.model_name.clone()
+        };
+        let template_name = extract_json_string(body, "chat_template");
+        let format = if let Some(ref tmpl) = template_name {
+            ChatTemplateFormat::from_gguf_template(tmpl)
+        } else {
+            ChatTemplateFormat::from_model_name(&model_name)
+        };
+        let base_prompt = format_chat(&messages, format);
+        let tools_section = format_tools_prompt(&tools, &tool_choice);
+        let tool_results_section = if tool_results.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", format_tool_results(&tool_results))
+        };
+        format!("{}{}{}", base_prompt, tools_section, tool_results_section)
+    };
+
+    let max_tokens = extract_json_number(body, "max_tokens").unwrap_or(128) as usize;
+    let temperature = extract_json_float(body, "temperature").unwrap_or(0.7);
+    let streaming = extract_json_bool(body, "stream").unwrap_or(false);
+
+    // Detect JSON mode from response_format
+    let json_mode = extract_response_format_type(body)
+        .map(|t| t == "json_object")
+        .unwrap_or(false);
+
+    let config = InferenceConfig {
+        temperature,
+        top_k: 40,
+        top_p: extract_json_float(body, "top_p").unwrap_or(0.9),
+        max_tokens,
+        stop_sequences: extract_json_string_array(body, "stop").unwrap_or_default(),
+        repetition_penalty: 1.0,
+        frequency_penalty: extract_json_float(body, "frequency_penalty").unwrap_or(0.0),
+        presence_penalty: extract_json_float(body, "presence_penalty").unwrap_or(0.0),
+        tfs_z: 0.0,
+        mirostat: 0,
+        mirostat_tau: 5.0,
+        mirostat_eta: 0.1,
+        grammar: extract_json_string(body, "grammar").unwrap_or_default(),
+                    min_p: 0.0,
+                    seed: None,
+    };
+
+    if streaming {
+        return handle_openai_streaming(stream, ctx, &prompt, &config);
+    }
+
+    let mut ctx = ctx.lock().unwrap();
+    let ModelContext {
+        ref gguf,
+        ref streamer,
+        ref mut cache,
+        ref model_name,
+        ..
+    } = *ctx;
+
+    match transformer::generate(gguf, streamer, cache, &prompt, &config) {
+        Ok(result) => {
+            // Check if the response contains tool calls
+            let detected_tool_calls = if !tools.is_empty() && has_tool_calls(&result.text) {
+                let calls = extract_tool_calls(&result.text);
+                // Validate each call against tool definitions
+                let valid_calls: Vec<_> = calls
+                    .into_iter()
+                    .filter(|c| validate_tool_call(c, &tools).is_ok())
+                    .collect();
+                if valid_calls.is_empty() {
+                    None
+                } else {
+                    Some(valid_calls)
+                }
+            } else {
+                None
+            };
+
+            let resp = if let Some(ref calls) = detected_tool_calls {
+                // Tool call response
+                let tool_calls_json = format_tool_calls_response(calls);
+                format!(
+                    r#"{{"id":"chatcmpl-ssd","object":"chat.completion","created":{},"model":"{}","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":{}}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{}}}}}"#,
+                    unix_timestamp(),
+                    model_name,
+                    tool_calls_json,
+                    result.prompt_tokens,
+                    result.token_count,
+                    result.prompt_tokens + result.token_count,
+                )
+            } else {
+                let output_text = if json_mode {
+                    extract_json_from_output(&result.text)
+                } else {
+                    result.text.clone()
+                };
+
+                format!(
+                    r#"{{"id":"chatcmpl-ssd","object":"chat.completion","created":{},"model":"{}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{}}}}}"#,
+                    unix_timestamp(),
+                    model_name,
+                    escape_json(&output_text),
+                    result.prompt_tokens,
+                    result.token_count,
+                    result.prompt_tokens + result.token_count,
+                )
+            };
+            send_json_response(stream, 200, &resp)
+        }
+        Err(e) => {
+            let resp = format!(
+                r#"{{"error":{{"message":"{}","type":"server_error"}}}}"#,
+                escape_json(&e.to_string())
+            );
+            send_json_response(stream, 500, &resp)
+        }
+    }
+}
+
+/// Handle streaming OpenAI chat — SSE format
+fn handle_openai_streaming(
+    stream: &mut TcpStream,
+    ctx: &Arc<Mutex<ModelContext>>,
+    prompt: &str,
+    config: &InferenceConfig,
+) -> Result<()> {
+    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n")?;
+
+    let mut ctx = ctx.lock().unwrap();
+    let ModelContext {
+        ref gguf,
+        ref streamer,
+        ref mut cache,
+        ref model_name,
+        ..
+    } = *ctx;
+
+    match transformer::generate_streaming(gguf, streamer, cache, prompt, config) {
+        Ok(mut gen) => {
+            while let Some(token_text) = gen.next_token()? {
+                let chunk = format!(
+                    r#"{{"id":"chatcmpl-ssd","object":"chat.completion.chunk","created":{},"model":"{}","choices":[{{"index":0,"delta":{{"content":"{}"}},"finish_reason":null}}]}}"#,
+                    unix_timestamp(),
+                    model_name,
+                    escape_json(&token_text),
+                );
+                write!(stream, "data: {}\n\n", chunk)?;
+                let _ = stream.flush();
+            }
+            // Send [DONE]
+            write!(stream, "data: [DONE]\n\n")?;
+            let _ = stream.flush();
+            Ok(())
+        }
+        Err(e) => {
+            let err = format!(
+                r#"{{"error":{{"message":"{}"}}}}"#,
+                escape_json(&e.to_string())
+            );
+            write!(stream, "data: {}\n\n", err)?;
+            Ok(())
+        }
+    }
+}
+
+fn handle_embeddings(
+    stream: &mut TcpStream,
+    ctx: &Arc<Mutex<ModelContext>>,
+    body: &str,
+) -> Result<()> {
+    // Support both "input": "string" and "input": ["string", ...]
+    let inputs = extract_embedding_inputs(body);
+    if inputs.is_empty() {
+        return send_json_response(
+            stream,
+            400,
+            r#"{"error":{"message":"'input' is required","type":"invalid_request_error"}}"#,
+        );
+    }
+
+    let mut ctx = ctx.lock().unwrap();
+    let ModelContext {
+        ref gguf,
+        ref streamer,
+        ref mut cache,
+        ref model_name,
+        ..
+    } = *ctx;
+
+    let mut data_entries = Vec::new();
+    let mut total_tokens = 0usize;
+
+    for (idx, input) in inputs.iter().enumerate() {
+        match transformer::embed(gguf, streamer, cache, input, true) {
+            Ok(result) => {
+                total_tokens += result.prompt_tokens;
+                // Format embedding array as JSON
+                let emb_json: Vec<String> = result
+                    .embedding
+                    .iter()
+                    .map(|v| format!("{:.8}", v))
+                    .collect();
+                data_entries.push(format!(
+                    r#"{{"object":"embedding","embedding":[{}],"index":{}}}"#,
+                    emb_json.join(","),
+                    idx
+                ));
+            }
+            Err(e) => {
+                let resp = format!(
+                    r#"{{"error":{{"message":"{}","type":"server_error"}}}}"#,
+                    escape_json(&e.to_string())
+                );
+                return send_json_response(stream, 500, &resp);
+            }
+        }
+    }
+
+    let resp = format!(
+        r#"{{"object":"list","data":[{}],"model":"{}","usage":{{"prompt_tokens":{},"total_tokens":{}}}}}"#,
+        data_entries.join(","),
+        model_name,
+        total_tokens,
+        total_tokens,
+    );
+    send_json_response(stream, 200, &resp)
+}
+
+fn handle_openai_models(stream: &mut TcpStream, ctx: &Arc<Mutex<ModelContext>>) -> Result<()> {
+    let ctx = ctx.lock().unwrap();
+    let resp = format!(
+        r#"{{"object":"list","data":[{{"id":"{}","object":"model","created":{},"owned_by":"ssd-llm"}}]}}"#,
+        ctx.model_name,
+        unix_timestamp(),
+    );
+    send_json_response(stream, 200, &resp)
+}
+
+/// Extract embedding inputs — supports "input": "text" and "input": ["text1", "text2"]
+fn extract_embedding_inputs(json: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    if let Some(pos) = json.find(r#""input""#) {
+        let after = &json[pos + 7..];
+        let after = after.trim_start();
+        if let Some(after) = after.strip_prefix(':') {
+            let after = after.trim_start();
+            if after.starts_with('[') {
+                // Array of strings
+                if let Some(end) = after.find(']') {
+                    let arr = &after[1..end];
+                    let mut in_string = false;
+                    let mut current = String::new();
+                    let mut escaped = false;
+                    for ch in arr.chars() {
+                        if escaped {
+                            current.push(ch);
+                            escaped = false;
+                            continue;
+                        }
+                        match ch {
+                            '\\' if in_string => {
+                                escaped = true;
+                                current.push(ch);
+                            }
+                            '"' => {
+                                if in_string {
+                                    results.push(current.clone());
+                                    current.clear();
+                                }
+                                in_string = !in_string;
+                            }
+                            _ if in_string => current.push(ch),
+                            _ => {}
+                        }
+                    }
+                }
+            } else if let Some(inner) = after.strip_prefix('"') {
+                // Single string
+                if let Some(end) = inner.find('"') {
+                    results.push(inner[..end].to_string());
+                }
+            }
+        }
+    }
+    results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_embedding_inputs_single_string() {
+        let json = r#"{"input": "hello world", "model": "test"}"#;
+        let inputs = extract_embedding_inputs(json);
+        assert_eq!(inputs, vec!["hello world"]);
+    }
+
+    #[test]
+    fn test_extract_embedding_inputs_array() {
+        let json = r#"{"input": ["hello", "world"], "model": "test"}"#;
+        let inputs = extract_embedding_inputs(json);
+        assert_eq!(inputs, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn test_extract_embedding_inputs_empty() {
+        let json = r#"{"model": "test"}"#;
+        let inputs = extract_embedding_inputs(json);
+        assert!(inputs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_embedding_inputs_single_in_array() {
+        let json = r#"{"input": ["only one"]}"#;
+        let inputs = extract_embedding_inputs(json);
+        assert_eq!(inputs, vec!["only one"]);
+    }
+
+    #[test]
+    fn test_extract_embedding_inputs_ollama_format() {
+        // Ollama /api/embed uses the same "input" field
+        let json = r#"{"model": "llama3", "input": "Why is the sky blue?"}"#;
+        let inputs = extract_embedding_inputs(json);
+        assert_eq!(inputs, vec!["Why is the sky blue?"]);
+    }
+
+    #[test]
+    fn test_extract_embedding_inputs_ollama_batch() {
+        let json =
+            r#"{"model": "llama3", "input": ["Why is the sky blue?", "Why is the grass green?"]}"#;
+        let inputs = extract_embedding_inputs(json);
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0], "Why is the sky blue?");
+        assert_eq!(inputs[1], "Why is the grass green?");
+    }
+}
+
+// --- Helpers ---
+
+fn write_chunk(stream: &mut TcpStream, data: &str) -> Result<()> {
+    if data.is_empty() {
+        stream.write_all(b"0\r\n\r\n")?;
+    } else {
+        let line = format!("{}\n", data); // newline-delimited JSON
+        write!(stream, "{:x}\r\n{}\r\n", line.len(), line)?;
+    }
+    Ok(())
+}
+
+fn send_response(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
+    let status_text = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Unknown",
+    };
+    let resp = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status, status_text, body.len(), body
+    );
+    stream.write_all(resp.as_bytes())?;
+    Ok(())
+}
+
+fn send_json_response(stream: &mut TcpStream, status: u16, json: &str) -> Result<()> {
+    let resp = format!(
+        "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+        status, json.len(), json
+    );
+    stream.write_all(resp.as_bytes())?;
+    Ok(())
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn chrono_now() -> String {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}Z", duration.as_secs())
+}
+
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let pattern = format!(r#""{}""#, key);
+    let pos = json.find(&pattern)?;
+    let after = &json[pos + pattern.len()..];
+    let after = after.trim_start().strip_prefix(':')?;
+    let after = after.trim_start().strip_prefix('"')?;
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+fn extract_json_number(json: &str, key: &str) -> Option<i64> {
+    let pattern = format!(r#""{}""#, key);
+    let pos = json.find(&pattern)?;
+    let after = &json[pos + pattern.len()..];
+    let after = after.trim_start().strip_prefix(':')?;
+    let after = after.trim_start();
+    let end = after.find(|c: char| !c.is_ascii_digit() && c != '-')?;
+    after[..end].parse().ok()
+}
+
+fn extract_json_float(json: &str, key: &str) -> Option<f32> {
+    let pattern = format!(r#""{}""#, key);
+    let pos = json.find(&pattern)?;
+    let after = &json[pos + pattern.len()..];
+    let after = after.trim_start().strip_prefix(':')?;
+    let after = after.trim_start();
+    let end = after
+        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+        .unwrap_or(after.len());
+    after[..end].parse().ok()
+}
+
+fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
+    let pattern = format!(r#""{}""#, key);
+    let pos = json.find(&pattern)?;
+    let after = &json[pos + pattern.len()..];
+    let after = after.trim_start().strip_prefix(':')?;
+    let after = after.trim_start();
+    if after.starts_with("true") {
+        Some(true)
+    } else if after.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn extract_last_message_content(json: &str) -> Option<String> {
+    let mut last_content = None;
+    let mut search_from = 0;
+    while let Some(pos) = json[search_from..].find(r#""content""#) {
+        let abs_pos = search_from + pos;
+        let after = &json[abs_pos + 9..];
+        if let Some(content) = after.trim_start().strip_prefix(':') {
+            let content = content.trim_start();
+            if let Some(content) = content.strip_prefix('"') {
+                if let Some(end) = content.find('"') {
+                    last_content = Some(content[..end].to_string());
+                }
+            }
+        }
+        search_from = abs_pos + 9;
+    }
+    last_content
+}
+
+/// Extract an array of strings from JSON, e.g. "stop": ["foo", "bar"]
+fn extract_json_string_array(json: &str, key: &str) -> Option<Vec<String>> {
+    let pattern = format!(r#""{}""#, key);
+    let pos = json.find(&pattern)?;
+    let after = &json[pos + pattern.len()..];
+    let after = after.trim_start().strip_prefix(':')?;
+    let after = after.trim_start();
+
+    // Handle single string value
+    if after.starts_with('"') {
+        let inner = after.strip_prefix('"')?;
+        let end = inner.find('"')?;
+        return Some(vec![inner[..end].to_string()]);
+    }
+
+    // Handle array
+    if !after.starts_with('[') {
+        return None;
+    }
+    let bracket_end = after.find(']')?;
+    let array_content = &after[1..bracket_end];
+
+    let mut result = Vec::new();
+    let mut search = array_content;
+    while let Some(start) = search.find('"') {
+        let inner = &search[start + 1..];
+        if let Some(end) = inner.find('"') {
+            result.push(inner[..end].to_string());
+            search = &inner[end + 1..];
+        } else {
+            break;
+        }
+    }
+    Some(result)
+}
+
+/// Extract the "type" from response_format: {"type": "json_object"}
+fn extract_response_format_type(json: &str) -> Option<String> {
+    let pos = json.find(r#""response_format""#)?;
+    let after = &json[pos + 17..];
+    // Find "type" within the next ~100 chars (inside the response_format object)
+    let chunk = &after[..after.len().min(200)];
+    extract_json_string(chunk, "type")
+}
+
+/// Extract a JSON value (object, array, or string) for a given key from a JSON body.
+/// Uses serde_json to properly parse the full body and extract the field.
+fn extract_json_value(json: &str, key: &str) -> Option<serde_json::Value> {
+    // Try full parse first
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(json) {
+        return map.get(key).cloned();
+    }
+    // Fallback: try to find the key and parse the value after it
+    let pattern = format!(r#""{}""#, key);
+    let pos = json.find(&pattern)?;
+    let after = &json[pos + pattern.len()..];
+    let after = after.trim_start().strip_prefix(':')?;
+    let after = after.trim_start();
+    serde_json::from_str::<serde_json::Value>(after)
+        .ok()
+        .or_else(|| {
+            // Try parsing just until we find the end of the value
+            let mut de = serde_json::Deserializer::from_str(after).into_iter::<serde_json::Value>();
+            de.next()?.ok()
+        })
+}
+
+/// Extract valid JSON from model output, trying to find the first complete JSON value
+fn extract_json_from_output(text: &str) -> String {
+    let trimmed = text.trim();
+
+    // Try parsing directly
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return trimmed.to_string();
+    }
+
+    // Try to find JSON starting with { or [
+    for start_char in ['{', '['] {
+        if let Some(start) = trimmed.find(start_char) {
+            let substring = &trimmed[start..];
+            // Try progressively longer substrings
+            let end_char = if start_char == '{' { '}' } else { ']' };
+            let mut depth = 0;
+            let mut in_string = false;
+            let mut escaped = false;
+
+            for (i, ch) in substring.char_indices() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match ch {
+                    '\\' if in_string => escaped = true,
+                    '"' => in_string = !in_string,
+                    c if !in_string && c == start_char => depth += 1,
+                    c if !in_string && c == end_char => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let candidate = &substring[..=i];
+                            if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                                return candidate.to_string();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Fallback: wrap in a JSON object
+    format!(
+        r#"{{"response":{}}}"#,
+        serde_json::to_string(trimmed).unwrap_or_else(|_| format!(r#""{}""#, escape_json(trimmed)))
+    )
+}
+
+/// Extract all chat messages (role + content pairs) from an OpenAI messages array
+fn extract_chat_messages(json: &str) -> Vec<crate::api::openai::ChatMessage> {
+    use crate::api::openai::{ChatMessage, Role};
+
+    let mut messages = Vec::new();
+
+    // Find "messages" array
+    let Some(msgs_pos) = json.find(r#""messages""#) else {
+        return messages;
+    };
+    let after = &json[msgs_pos + 10..];
+    let Some(arr_start) = after.find('[') else {
+        return messages;
+    };
+    let arr_content = &after[arr_start..];
+
+    // Find each message object by looking for "role" keys
+    let mut search_from = 0;
+    while let Some(role_pos) = arr_content[search_from..].find(r#""role""#) {
+        let abs_pos = search_from + role_pos;
+        let role_after = &arr_content[abs_pos + 6..];
+        let role_str = role_after
+            .trim_start()
+            .strip_prefix(':')
+            .and_then(|s| s.trim_start().strip_prefix('"'))
+            .and_then(|s| s.find('"').map(|end| &s[..end]));
+
+        // Find matching "content" after this "role"
+        let content_after = &arr_content[abs_pos..];
+        let content_str = content_after.find(r#""content""#).and_then(|cp| {
+            let ca = &content_after[cp + 9..];
+            ca.trim_start().strip_prefix(':').and_then(|s| {
+                let s = s.trim_start();
+                s.strip_prefix('"')
+                    .and_then(|s| s.find('"').map(|end| &s[..end]))
+            })
+        });
+
+        if let (Some(role), Some(content)) = (role_str, content_str) {
+            messages.push(ChatMessage {
+                role: Role::from_str(role),
+                content: content.to_string(),
+            });
+        }
+
+        search_from = abs_pos + 6;
+    }
+
+    messages
+}

@@ -1,0 +1,1258 @@
+//! Metal GPU dispatch via metal-rs
+//!
+//! v0.4: Real GPU compute pipeline using the metal crate.
+//! Dispatches matmul, RMSNorm, softmax, RoPE, and SiLU to the GPU
+//! for tensors above the dispatch threshold.
+
+#[cfg(target_os = "macos")]
+use metal::{
+    Buffer, CommandQueue, ComputePipelineState, Device, Library, MTLResourceOptions, MTLSize,
+};
+
+use tracing::{info, warn};
+
+/// Minimum elements to justify GPU dispatch overhead
+const MIN_GPU_ELEMENTS: usize = 4096;
+
+/// Metal GPU context holding device, command queue, and compiled pipelines
+pub struct MetalGpu {
+    #[cfg(target_os = "macos")]
+    device: Device,
+    #[cfg(target_os = "macos")]
+    queue: CommandQueue,
+    #[cfg(target_os = "macos")]
+    pipelines: GpuPipelines,
+    available: bool,
+}
+
+#[cfg(target_os = "macos")]
+struct GpuPipelines {
+    matvec_f32: ComputePipelineState,
+    matvec_q4_0: ComputePipelineState,
+    matvec_q3_k: ComputePipelineState,
+    matvec_q4_k: ComputePipelineState,
+    matvec_q5_k: ComputePipelineState,
+    matvec_q6_k: ComputePipelineState,
+    matvec_q2_k: ComputePipelineState,
+    matvec_q8_k: ComputePipelineState,
+    matvec_q8_0: ComputePipelineState,
+    matvec_iq4_nl: ComputePipelineState,
+    matvec_iq4_xs: ComputePipelineState,
+    matvec_iq3_xxs: ComputePipelineState,
+    matvec_iq3_s: ComputePipelineState,
+    matvec_iq2_xxs: ComputePipelineState,
+    matvec_iq2_xs: ComputePipelineState,
+    matvec_bf16: ComputePipelineState,
+    matvec_f16: ComputePipelineState,
+    rmsnorm_sumsq: ComputePipelineState,
+    rmsnorm_normalize: ComputePipelineState,
+    softmax_exp: ComputePipelineState,
+    softmax_normalize: ComputePipelineState,
+    rope_f32: ComputePipelineState,
+    silu_f32: ComputePipelineState,
+    elementwise_mul: ComputePipelineState,
+    flash_attention_f32: ComputePipelineState,
+    fused_swiglu_f32: ComputePipelineState,
+    fused_residual_rmsnorm_sumsq: ComputePipelineState,
+    fused_qkv_f32: ComputePipelineState,
+    fused_qkv_rope_f32: ComputePipelineState,
+    moe_gate_logits: ComputePipelineState,
+    moe_topk_softmax: ComputePipelineState,
+    moe_expert_swiglu: ComputePipelineState,
+    fused_rmsnorm_linear_f32: ComputePipelineState,
+    compute_inv_rms: ComputePipelineState,
+    fused_post_attn_norm_sumsq: ComputePipelineState,
+    fused_post_attn_norm_apply: ComputePipelineState,
+}
+
+unsafe impl Send for MetalGpu {}
+unsafe impl Sync for MetalGpu {}
+
+impl MetalGpu {
+    /// Create a new Metal GPU context with compiled shader pipelines
+    pub fn new() -> Option<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let device = Device::system_default()?;
+            info!("Metal GPU: {}", device.name());
+
+            let queue = device.new_command_queue();
+
+            // Compile shaders
+            let shader_src = include_str!("shaders/kernels.metal");
+            let library = device
+                .new_library_with_source(shader_src, &metal::CompileOptions::new())
+                .map_err(|e| {
+                    warn!("Failed to compile Metal shaders: {}", e);
+                    e
+                })
+                .ok()?;
+
+            let pipelines = Self::build_pipelines(&device, &library)?;
+            info!("Metal GPU pipelines compiled successfully");
+
+            Some(Self {
+                device,
+                queue,
+                pipelines,
+                available: true,
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            warn!("Metal GPU not available on this platform");
+            None
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn build_pipelines(device: &Device, library: &Library) -> Option<GpuPipelines> {
+        let make_pipeline = |name: &str| -> Option<ComputePipelineState> {
+            let func = library.get_function(name, None).ok()?;
+            device.new_compute_pipeline_state_with_function(&func).ok()
+        };
+
+        Some(GpuPipelines {
+            matvec_f32: make_pipeline("matvec_f32")?,
+            matvec_q4_0: make_pipeline("matvec_q4_0")?,
+            matvec_q3_k: make_pipeline("matvec_q3_k")?,
+            matvec_q4_k: make_pipeline("matvec_q4_k")?,
+            matvec_q5_k: make_pipeline("matvec_q5_k")?,
+            matvec_q6_k: make_pipeline("matvec_q6_k")?,
+            matvec_q8_0: make_pipeline("matvec_q8_0")?,
+            matvec_q2_k: make_pipeline("matvec_q2_k")?,
+            matvec_q8_k: make_pipeline("matvec_q8_k")?,
+            matvec_iq4_nl: make_pipeline("matvec_iq4_nl")?,
+            matvec_iq4_xs: make_pipeline("matvec_iq4_xs")?,
+            matvec_iq3_xxs: make_pipeline("matvec_iq3_xxs")?,
+            matvec_iq3_s: make_pipeline("matvec_iq3_s")?,
+            matvec_iq2_xxs: make_pipeline("matvec_iq2_xxs")?,
+            matvec_iq2_xs: make_pipeline("matvec_iq2_xs")?,
+            matvec_bf16: make_pipeline("matvec_bf16")?,
+            matvec_f16: make_pipeline("matvec_f16")?,
+            rmsnorm_sumsq: make_pipeline("rmsnorm_sumsq")?,
+            rmsnorm_normalize: make_pipeline("rmsnorm_normalize")?,
+            softmax_exp: make_pipeline("softmax_exp")?,
+            softmax_normalize: make_pipeline("softmax_normalize")?,
+            rope_f32: make_pipeline("rope_f32")?,
+            silu_f32: make_pipeline("silu_f32")?,
+            elementwise_mul: make_pipeline("elementwise_mul_f32")?,
+            flash_attention_f32: make_pipeline("flash_attention_f32")?,
+            fused_swiglu_f32: make_pipeline("fused_swiglu_f32")?,
+            fused_residual_rmsnorm_sumsq: make_pipeline("fused_residual_rmsnorm_sumsq")?,
+            fused_qkv_f32: make_pipeline("fused_qkv_f32")?,
+            fused_qkv_rope_f32: make_pipeline("fused_qkv_rope_f32")?,
+            moe_gate_logits: make_pipeline("moe_gate_logits")?,
+            moe_topk_softmax: make_pipeline("moe_topk_softmax")?,
+            moe_expert_swiglu: make_pipeline("moe_expert_swiglu")?,
+            fused_rmsnorm_linear_f32: make_pipeline("fused_rmsnorm_linear_f32")?,
+            compute_inv_rms: make_pipeline("compute_inv_rms")?,
+            fused_post_attn_norm_sumsq: make_pipeline("fused_post_attn_norm_sumsq")?,
+            fused_post_attn_norm_apply: make_pipeline("fused_post_attn_norm_apply")?,
+        })
+    }
+
+    /// Whether Metal GPU is available
+    pub fn is_available(&self) -> bool {
+        self.available
+    }
+
+    /// Whether GPU dispatch is available and beneficial for this size
+    pub fn should_dispatch(&self, elements: usize) -> bool {
+        self.available && elements >= MIN_GPU_ELEMENTS
+    }
+
+    /// GPU matrix-vector multiply: y = W × x
+    /// W: (out_dim × in_dim), x: (in_dim,), y: (out_dim,)
+    #[cfg(target_os = "macos")]
+    pub fn matvec_f32(&self, w: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        let w_buf = self.create_buffer_with_data(w);
+        let x_buf = self.create_buffer_with_data(x);
+        let y_buf = self.create_buffer::<f32>(out_dim);
+        let out_dim_buf = self.create_buffer_with_data(&[out_dim as u32]);
+        let in_dim_buf = self.create_buffer_with_data(&[in_dim as u32]);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&self.pipelines.matvec_f32);
+        encoder.set_buffer(0, Some(&w_buf), 0);
+        encoder.set_buffer(1, Some(&x_buf), 0);
+        encoder.set_buffer(2, Some(&y_buf), 0);
+        encoder.set_buffer(3, Some(&out_dim_buf), 0);
+        encoder.set_buffer(4, Some(&in_dim_buf), 0);
+
+        let thread_count = MTLSize::new(out_dim as u64, 1, 1);
+        let threadgroup_size = MTLSize::new(
+            (self
+                .pipelines
+                .matvec_f32
+                .max_total_threads_per_threadgroup())
+            .min(out_dim as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(thread_count, threadgroup_size);
+        encoder.end_encoding();
+
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        self.read_buffer::<f32>(&y_buf, out_dim)
+    }
+
+    /// GPU RMS normalization in-place
+    #[cfg(target_os = "macos")]
+    pub fn rmsnorm_f32(&self, x: &mut [f32], weight: &[f32], eps: f32) {
+        let n = x.len();
+
+        // Phase 1: compute sum of squares on GPU
+        let x_buf = self.create_buffer_with_data(x);
+        let n_threads = 256usize;
+        let partial_buf = self.create_buffer::<f32>(n_threads);
+        let n_buf = self.create_buffer_with_data(&[n as u32]);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.rmsnorm_sumsq);
+        encoder.set_buffer(0, Some(&x_buf), 0);
+        encoder.set_buffer(1, Some(&partial_buf), 0);
+        encoder.set_buffer(2, Some(&n_buf), 0);
+        let tg = MTLSize::new(n_threads as u64, 1, 1);
+        encoder.dispatch_threads(tg, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // CPU reduction of partial sums
+        let partials = self.read_buffer::<f32>(&partial_buf, n_threads);
+        let sum_sq: f32 = partials.iter().sum();
+        let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+
+        // Phase 2: normalize on GPU
+        let weight_buf = self.create_buffer_with_data(weight);
+        let inv_rms_buf = self.create_buffer_with_data(&[inv_rms]);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.rmsnorm_normalize);
+        encoder.set_buffer(0, Some(&x_buf), 0);
+        encoder.set_buffer(1, Some(&weight_buf), 0);
+        encoder.set_buffer(2, Some(&inv_rms_buf), 0);
+        encoder.set_buffer(3, Some(&n_buf), 0);
+        let threads = MTLSize::new(n as u64, 1, 1);
+        let tg = MTLSize::new(
+            (self
+                .pipelines
+                .rmsnorm_normalize
+                .max_total_threads_per_threadgroup())
+            .min(n as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(threads, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let result = self.read_buffer::<f32>(&x_buf, n);
+        x.copy_from_slice(&result);
+    }
+
+    /// GPU softmax in-place
+    #[cfg(target_os = "macos")]
+    pub fn softmax_f32(&self, x: &mut [f32]) {
+        let n = x.len();
+        if n == 0 {
+            return;
+        }
+
+        // CPU: find max (small reduction)
+        let max_val = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let x_buf = self.create_buffer_with_data(x);
+        let max_buf = self.create_buffer_with_data(&[max_val]);
+        let n_threads = 256usize.min(n);
+        let partial_buf = self.create_buffer::<f32>(n_threads);
+        let n_buf = self.create_buffer_with_data(&[n as u32]);
+
+        // Phase 1: exp and partial sums
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.softmax_exp);
+        encoder.set_buffer(0, Some(&x_buf), 0);
+        encoder.set_buffer(1, Some(&max_buf), 0);
+        encoder.set_buffer(2, Some(&partial_buf), 0);
+        encoder.set_buffer(3, Some(&n_buf), 0);
+        let tg = MTLSize::new(n_threads as u64, 1, 1);
+        encoder.dispatch_threads(tg, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // CPU reduction
+        let partials = self.read_buffer::<f32>(&partial_buf, n_threads);
+        let sum: f32 = partials.iter().sum();
+        let inv_sum = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+
+        // Phase 2: normalize
+        let inv_sum_buf = self.create_buffer_with_data(&[inv_sum]);
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.softmax_normalize);
+        encoder.set_buffer(0, Some(&x_buf), 0);
+        encoder.set_buffer(1, Some(&inv_sum_buf), 0);
+        encoder.set_buffer(2, Some(&n_buf), 0);
+        let threads = MTLSize::new(n as u64, 1, 1);
+        let tg = MTLSize::new(
+            (self
+                .pipelines
+                .softmax_normalize
+                .max_total_threads_per_threadgroup())
+            .min(n as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(threads, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let result = self.read_buffer::<f32>(&x_buf, n);
+        x.copy_from_slice(&result);
+    }
+
+    /// GPU RoPE in-place
+    #[cfg(target_os = "macos")]
+    pub fn rope_f32(
+        &self,
+        x: &mut [f32],
+        head_dim: usize,
+        n_heads: usize,
+        position: usize,
+        theta_base: f32,
+    ) {
+        let x_buf = self.create_buffer_with_data(x);
+        let head_dim_buf = self.create_buffer_with_data(&[head_dim as u32]);
+        let n_heads_buf = self.create_buffer_with_data(&[n_heads as u32]);
+        let pos_buf = self.create_buffer_with_data(&[position as u32]);
+        let theta_buf = self.create_buffer_with_data(&[theta_base]);
+
+        let total_pairs = (n_heads * head_dim / 2) as u64;
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.rope_f32);
+        encoder.set_buffer(0, Some(&x_buf), 0);
+        encoder.set_buffer(1, Some(&head_dim_buf), 0);
+        encoder.set_buffer(2, Some(&n_heads_buf), 0);
+        encoder.set_buffer(3, Some(&pos_buf), 0);
+        encoder.set_buffer(4, Some(&theta_buf), 0);
+        let threads = MTLSize::new(total_pairs, 1, 1);
+        let tg = MTLSize::new(
+            (self.pipelines.rope_f32.max_total_threads_per_threadgroup()).min(total_pairs),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(threads, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let result = self.read_buffer::<f32>(&x_buf, x.len());
+        x.copy_from_slice(&result);
+    }
+
+    /// GPU SiLU in-place
+    #[cfg(target_os = "macos")]
+    pub fn silu_f32(&self, x: &mut [f32]) {
+        let n = x.len();
+        let x_buf = self.create_buffer_with_data(x);
+        let n_buf = self.create_buffer_with_data(&[n as u32]);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.silu_f32);
+        encoder.set_buffer(0, Some(&x_buf), 0);
+        encoder.set_buffer(1, Some(&n_buf), 0);
+        let threads = MTLSize::new(n as u64, 1, 1);
+        let tg = MTLSize::new(
+            (self.pipelines.silu_f32.max_total_threads_per_threadgroup()).min(n as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(threads, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let result = self.read_buffer::<f32>(&x_buf, n);
+        x.copy_from_slice(&result);
+    }
+
+    /// GPU quantized matvec dispatch for Q4_0
+    #[cfg(target_os = "macos")]
+    pub fn matvec_q4_0(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_q4_0, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for Q3_K
+    #[cfg(target_os = "macos")]
+    pub fn matvec_q3_k(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_q3_k, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for Q4_K
+    #[cfg(target_os = "macos")]
+    pub fn matvec_q4_k(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_q4_k, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for Q5_K
+    #[cfg(target_os = "macos")]
+    pub fn matvec_q5_k(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_q5_k, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for Q6_K
+    #[cfg(target_os = "macos")]
+    pub fn matvec_q6_k(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_q6_k, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for Q8_0
+    #[cfg(target_os = "macos")]
+    pub fn matvec_q8_0(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_q8_0, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for Q2_K
+    #[cfg(target_os = "macos")]
+    pub fn matvec_q2_k(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_q2_k, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for Q8_K
+    #[cfg(target_os = "macos")]
+    pub fn matvec_q8_k(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_q8_k, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for IQ4_NL
+    #[cfg(target_os = "macos")]
+    pub fn matvec_iq4_nl(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_iq4_nl, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for IQ4_XS
+    #[cfg(target_os = "macos")]
+    pub fn matvec_iq4_xs(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_iq4_xs, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for IQ3_XXS
+    #[cfg(target_os = "macos")]
+    pub fn matvec_iq3_xxs(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_iq3_xxs, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for IQ3_S
+    #[cfg(target_os = "macos")]
+    pub fn matvec_iq3_s(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_iq3_s, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for IQ2_XXS
+    #[cfg(target_os = "macos")]
+    pub fn matvec_iq2_xxs(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_iq2_xxs, w, x, out_dim, in_dim)
+    }
+
+    /// GPU quantized matvec dispatch for IQ2_XS
+    #[cfg(target_os = "macos")]
+    pub fn matvec_iq2_xs(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_iq2_xs, w, x, out_dim, in_dim)
+    }
+
+    /// GPU matvec dispatch for BF16 (brain float 16)
+    #[cfg(target_os = "macos")]
+    pub fn matvec_bf16(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_bf16, w, x, out_dim, in_dim)
+    }
+
+    /// GPU matvec dispatch for F16 (IEEE 754 half)
+    #[cfg(target_os = "macos")]
+    pub fn matvec_f16(&self, w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+        self.dispatch_quantized_matvec(&self.pipelines.matvec_f16, w, x, out_dim, in_dim)
+    }
+
+    /// Generic dispatch for quantized matvec kernels
+    #[cfg(target_os = "macos")]
+    fn dispatch_quantized_matvec(
+        &self,
+        pipeline: &ComputePipelineState,
+        w: &[u8],
+        x: &[f32],
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Vec<f32> {
+        let w_buf = self.device.new_buffer_with_data(
+            w.as_ptr() as *const std::ffi::c_void,
+            w.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let x_buf = self.create_buffer_with_data(x);
+        let y_buf = self.create_buffer::<f32>(out_dim);
+        let out_dim_buf = self.create_buffer_with_data(&[out_dim as u32]);
+        let in_dim_buf = self.create_buffer_with_data(&[in_dim as u32]);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(&w_buf), 0);
+        encoder.set_buffer(1, Some(&x_buf), 0);
+        encoder.set_buffer(2, Some(&y_buf), 0);
+        encoder.set_buffer(3, Some(&out_dim_buf), 0);
+        encoder.set_buffer(4, Some(&in_dim_buf), 0);
+
+        let thread_count = MTLSize::new(out_dim as u64, 1, 1);
+        let threadgroup_size = MTLSize::new(
+            pipeline
+                .max_total_threads_per_threadgroup()
+                .min(out_dim as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(thread_count, threadgroup_size);
+        encoder.end_encoding();
+
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        self.read_buffer::<f32>(&y_buf, out_dim)
+    }
+
+    /// GPU Flash Attention: fused QK scoring + online softmax + V accumulation
+    /// Returns attention output [n_head × head_dim] for all heads in a single dispatch.
+    ///
+    /// Arguments:
+    ///   q_heads:  [n_head, head_dim] — pre-projected, RoPE'd query vectors
+    ///   k_cache:  [seq_len, n_head_kv, head_dim] — flattened key cache
+    ///   v_cache:  [seq_len, n_head_kv, head_dim] — flattened value cache
+    ///   n_head, n_head_kv, head_dim, seq_len: dimensions
+    ///   window_start, window_end: attention window bounds
+    #[cfg(target_os = "macos")]
+    pub fn flash_attention_f32(
+        &self,
+        q_heads: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        seq_len: usize,
+        window_start: usize,
+        window_end: usize,
+    ) -> Vec<f32> {
+        let q_buf = self.create_buffer_with_data(q_heads);
+        let k_buf = self.create_buffer_with_data(k_cache);
+        let v_buf = self.create_buffer_with_data(v_cache);
+        let out_buf = self.create_buffer::<f32>(n_head * head_dim);
+        let params: [u32; 6] = [
+            n_head as u32,
+            n_head_kv as u32,
+            head_dim as u32,
+            seq_len as u32,
+            window_start as u32,
+            window_end as u32,
+        ];
+        let params_buf = self.create_buffer_with_data(&params);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&self.pipelines.flash_attention_f32);
+        encoder.set_buffer(0, Some(&q_buf), 0);
+        encoder.set_buffer(1, Some(&k_buf), 0);
+        encoder.set_buffer(2, Some(&v_buf), 0);
+        encoder.set_buffer(3, Some(&out_buf), 0);
+        encoder.set_buffer(4, Some(&params_buf), 0);
+
+        let thread_count = MTLSize::new(n_head as u64, 1, 1);
+        let threadgroup_size = MTLSize::new(
+            self.pipelines
+                .flash_attention_f32
+                .max_total_threads_per_threadgroup()
+                .min(n_head as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(thread_count, threadgroup_size);
+        encoder.end_encoding();
+
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        self.read_buffer::<f32>(&out_buf, n_head * head_dim)
+    }
+
+    // --- MoE GPU dispatch ---
+
+    /// GPU MoE gating: compute gate logits + softmax + top-K selection.
+    /// Returns (expert_indices, expert_weights) with re-normalized weights.
+    #[cfg(target_os = "macos")]
+    pub fn moe_gating_f32(
+        &self,
+        x: &[f32],
+        gate_weights: &[f32],
+        n_experts: usize,
+        n_experts_used: usize,
+        n_embd: usize,
+    ) -> (Vec<u32>, Vec<f32>) {
+        let x_buf = self.create_buffer_with_data(x);
+        let gate_buf = self.create_buffer_with_data(gate_weights);
+        let logits_buf = self.create_buffer::<f32>(n_experts);
+        let n_embd_buf = self.create_buffer_with_data(&[n_embd as u32]);
+        let n_experts_buf = self.create_buffer_with_data(&[n_experts as u32]);
+
+        // Phase 1: gate logits
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.moe_gate_logits);
+        encoder.set_buffer(0, Some(&gate_buf), 0);
+        encoder.set_buffer(1, Some(&x_buf), 0);
+        encoder.set_buffer(2, Some(&logits_buf), 0);
+        encoder.set_buffer(3, Some(&n_embd_buf), 0);
+        encoder.set_buffer(4, Some(&n_experts_buf), 0);
+        let threads = MTLSize::new(n_experts as u64, 1, 1);
+        let tg = MTLSize::new(
+            self.pipelines
+                .moe_gate_logits
+                .max_total_threads_per_threadgroup()
+                .min(n_experts as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(threads, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // Phase 2: softmax + top-K
+        let indices_buf = self.create_buffer::<u32>(n_experts_used);
+        let weights_buf = self.create_buffer::<f32>(n_experts_used);
+        let n_used_buf = self.create_buffer_with_data(&[n_experts_used as u32]);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.moe_topk_softmax);
+        encoder.set_buffer(0, Some(&logits_buf), 0);
+        encoder.set_buffer(1, Some(&indices_buf), 0);
+        encoder.set_buffer(2, Some(&weights_buf), 0);
+        encoder.set_buffer(3, Some(&n_experts_buf), 0);
+        encoder.set_buffer(4, Some(&n_used_buf), 0);
+        let one = MTLSize::new(1, 1, 1);
+        encoder.dispatch_threads(one, one);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let indices = self.read_buffer::<u32>(&indices_buf, n_experts_used);
+        let weights = self.read_buffer::<f32>(&weights_buf, n_experts_used);
+        (indices, weights)
+    }
+
+    /// GPU fused MoE expert SwiGLU: computes the intermediate = silu(gate·x) * (up·x)
+    /// Returns the intermediate vector of size n_ff, ready for down_proj matvec.
+    #[cfg(target_os = "macos")]
+    pub fn moe_expert_swiglu_f32(
+        &self,
+        x: &[f32],
+        w_gate: &[f32],
+        w_up: &[f32],
+        n_embd: usize,
+        n_ff: usize,
+    ) -> Vec<f32> {
+        let x_buf = self.create_buffer_with_data(x);
+        let gate_buf = self.create_buffer_with_data(w_gate);
+        let up_buf = self.create_buffer_with_data(w_up);
+        let inter_buf = self.create_buffer::<f32>(n_ff);
+        let n_ff_buf = self.create_buffer_with_data(&[n_ff as u32]);
+        let n_embd_buf = self.create_buffer_with_data(&[n_embd as u32]);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.moe_expert_swiglu);
+        encoder.set_buffer(0, Some(&x_buf), 0);
+        encoder.set_buffer(1, Some(&gate_buf), 0);
+        encoder.set_buffer(2, Some(&up_buf), 0);
+        encoder.set_buffer(3, Some(&inter_buf), 0);
+        encoder.set_buffer(4, Some(&n_ff_buf), 0);
+        encoder.set_buffer(5, Some(&n_embd_buf), 0);
+        let threads = MTLSize::new(n_ff as u64, 1, 1);
+        let tg = MTLSize::new(
+            self.pipelines
+                .moe_expert_swiglu
+                .max_total_threads_per_threadgroup()
+                .min(n_ff as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(threads, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        self.read_buffer::<f32>(&inter_buf, n_ff)
+    }
+
+    /// Full GPU-accelerated MoE forward pass: gating + expert dispatch + weighted sum.
+    /// Dispatches gating on GPU, then runs each selected expert's SwiGLU + down_proj
+    /// on GPU, accumulating the weighted output.
+    #[cfg(target_os = "macos")]
+    pub fn moe_forward_f32(
+        &self,
+        x: &[f32],
+        gate_weights: &[f32],
+        expert_w_gates: &[&[f32]],
+        expert_w_ups: &[&[f32]],
+        expert_w_downs: &[&[f32]],
+        n_experts: usize,
+        n_experts_used: usize,
+        n_embd: usize,
+    ) -> Vec<f32> {
+        let n_ff = if !expert_w_gates.is_empty() {
+            expert_w_gates[0].len() / n_embd
+        } else {
+            return vec![0.0f32; n_embd];
+        };
+
+        // GPU gating
+        let (indices, weights) =
+            self.moe_gating_f32(x, gate_weights, n_experts, n_experts_used, n_embd);
+
+        // Dispatch selected experts on GPU
+        let mut output = vec![0.0f32; n_embd];
+
+        for (idx, weight) in indices.iter().zip(weights.iter()) {
+            let expert_idx = *idx as usize;
+            if expert_idx >= n_experts {
+                continue;
+            }
+
+            // Fused SwiGLU on GPU
+            let intermediate = self.moe_expert_swiglu_f32(
+                x,
+                expert_w_gates[expert_idx],
+                expert_w_ups[expert_idx],
+                n_embd,
+                n_ff,
+            );
+
+            // down_proj matvec on GPU
+            let expert_out =
+                self.matvec_f32(expert_w_downs[expert_idx], &intermediate, n_embd, n_ff);
+
+            // Weighted accumulation
+            for (o, e) in output.iter_mut().zip(expert_out.iter()) {
+                *o += weight * e;
+            }
+        }
+
+        output
+    }
+
+    // --- Buffer helpers ---
+
+    #[cfg(target_os = "macos")]
+    fn create_buffer_with_data<T: Copy>(&self, data: &[T]) -> Buffer {
+        let size = std::mem::size_of_val(data) as u64;
+        self.device.new_buffer_with_data(
+            data.as_ptr() as *const std::ffi::c_void,
+            size,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_buffer<T>(&self, count: usize) -> Buffer {
+        let size = (count * std::mem::size_of::<T>()) as u64;
+        self.device
+            .new_buffer(size, MTLResourceOptions::StorageModeShared)
+    }
+
+    /// Fused SwiGLU feed-forward on GPU: gate_proj + silu + up_proj + mul + down_proj
+    /// Returns the FFN output vector of size n_embd.
+    #[cfg(target_os = "macos")]
+    pub fn feed_forward_f32(
+        &self,
+        x: &[f32],
+        w_gate: &[f32],
+        w_up: &[f32],
+        w_down: &[f32],
+        n_embd: usize,
+    ) -> Vec<f32> {
+        let n_ff = w_gate.len() / n_embd;
+        if n_ff == 0 {
+            return vec![0.0f32; n_embd];
+        }
+
+        // Phase 1: Fused SwiGLU — gate + silu + up + mul in one dispatch
+        let w_gate_buf = self.create_buffer_with_data(w_gate);
+        let w_up_buf = self.create_buffer_with_data(w_up);
+        let x_buf = self.create_buffer_with_data(x);
+        let intermediate_buf = self.create_buffer::<f32>(n_ff);
+        let n_ff_buf = self.create_buffer_with_data(&[n_ff as u32]);
+        let n_embd_buf = self.create_buffer_with_data(&[n_embd as u32]);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.fused_swiglu_f32);
+        encoder.set_buffer(0, Some(&w_gate_buf), 0);
+        encoder.set_buffer(1, Some(&w_up_buf), 0);
+        encoder.set_buffer(2, Some(&x_buf), 0);
+        encoder.set_buffer(3, Some(&intermediate_buf), 0);
+        encoder.set_buffer(4, Some(&n_ff_buf), 0);
+        encoder.set_buffer(5, Some(&n_embd_buf), 0);
+
+        let threads = MTLSize::new(n_ff as u64, 1, 1);
+        let tg = MTLSize::new(
+            (self
+                .pipelines
+                .fused_swiglu_f32
+                .max_total_threads_per_threadgroup())
+            .min(n_ff as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(threads, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // Phase 2: down_proj matvec — reuse existing GPU matvec
+        let intermediate = self.read_buffer::<f32>(&intermediate_buf, n_ff);
+        self.matvec_f32(w_down, &intermediate, n_embd, n_ff)
+    }
+
+    /// Fused residual add + RMS normalization in-place on GPU.
+    /// Computes: x[i] += residual[i], then x[i] = (x[i] / rms) * weight[i]
+    /// Saves one full memory pass compared to separate residual add + rmsnorm.
+    #[cfg(target_os = "macos")]
+    pub fn fused_residual_rmsnorm_f32(
+        &self,
+        x: &mut [f32],
+        residual: &[f32],
+        weight: &[f32],
+        eps: f32,
+    ) {
+        let n = x.len();
+        debug_assert_eq!(n, residual.len());
+        debug_assert_eq!(n, weight.len());
+
+        // Phase 1: fused residual add + sum of squares
+        let x_buf = self.create_buffer_with_data(x);
+        let res_buf = self.create_buffer_with_data(residual);
+        let n_threads = 256usize;
+        let partial_buf = self.create_buffer::<f32>(n_threads);
+        let n_buf = self.create_buffer_with_data(&[n as u32]);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.fused_residual_rmsnorm_sumsq);
+        encoder.set_buffer(0, Some(&x_buf), 0);
+        encoder.set_buffer(1, Some(&res_buf), 0);
+        encoder.set_buffer(2, Some(&partial_buf), 0);
+        encoder.set_buffer(3, Some(&n_buf), 0);
+        let tg = MTLSize::new(n_threads as u64, 1, 1);
+        encoder.dispatch_threads(tg, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // CPU reduction of partial sums
+        let partials = self.read_buffer::<f32>(&partial_buf, n_threads);
+        let sum_sq: f32 = partials.iter().sum();
+        let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+
+        // Phase 2: normalize (reuse existing rmsnorm_normalize pipeline)
+        let weight_buf = self.create_buffer_with_data(weight);
+        let inv_rms_buf = self.create_buffer_with_data(&[inv_rms]);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.rmsnorm_normalize);
+        encoder.set_buffer(0, Some(&x_buf), 0);
+        encoder.set_buffer(1, Some(&weight_buf), 0);
+        encoder.set_buffer(2, Some(&inv_rms_buf), 0);
+        encoder.set_buffer(3, Some(&n_buf), 0);
+        let threads = MTLSize::new(n as u64, 1, 1);
+        let tg = MTLSize::new(
+            (self
+                .pipelines
+                .rmsnorm_normalize
+                .max_total_threads_per_threadgroup())
+            .min(n as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(threads, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let result = self.read_buffer::<f32>(&x_buf, n);
+        x.copy_from_slice(&result);
+    }
+
+    /// Fused QKV projection: compute Q, K, V in a single GPU dispatch
+    ///
+    /// Instead of 3 separate matvec dispatches (Q=Wq·x, K=Wk·x, V=Wv·x),
+    /// this dispatches all three as a single kernel where each thread computes
+    /// one output element across the combined Q+K+V output space.
+    /// Reduces command buffer overhead from 3 dispatches to 1.
+    #[cfg(target_os = "macos")]
+    pub fn fused_qkv_f32(
+        &self,
+        wq: &[f32],
+        wk: &[f32],
+        wv: &[f32],
+        x: &[f32],
+        q_dim: usize,
+        kv_dim: usize,
+        n_embd: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let total_out = q_dim + kv_dim + kv_dim;
+
+        // Don't use GPU for small projections
+        if total_out * n_embd < MIN_GPU_ELEMENTS {
+            let q = crate::metal::compute::matvec_f32_simd(wq, x, q_dim, n_embd);
+            let k = crate::metal::compute::matvec_f32_simd(wk, x, kv_dim, n_embd);
+            let v = crate::metal::compute::matvec_f32_simd(wv, x, kv_dim, n_embd);
+            return (q, k, v);
+        }
+
+        let opts = MTLResourceOptions::StorageModeShared;
+
+        let wq_buf =
+            self.device
+                .new_buffer_with_data(wq.as_ptr() as *const _, (wq.len() * 4) as u64, opts);
+        let wk_buf =
+            self.device
+                .new_buffer_with_data(wk.as_ptr() as *const _, (wk.len() * 4) as u64, opts);
+        let wv_buf =
+            self.device
+                .new_buffer_with_data(wv.as_ptr() as *const _, (wv.len() * 4) as u64, opts);
+        let x_buf =
+            self.device
+                .new_buffer_with_data(x.as_ptr() as *const _, (x.len() * 4) as u64, opts);
+        let q_buf = self.device.new_buffer((q_dim * 4) as u64, opts);
+        let k_buf = self.device.new_buffer((kv_dim * 4) as u64, opts);
+        let v_buf = self.device.new_buffer((kv_dim * 4) as u64, opts);
+
+        let q_dim_u32 = q_dim as u32;
+        let kv_dim_u32 = kv_dim as u32;
+        let n_embd_u32 = n_embd as u32;
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.fused_qkv_f32);
+        encoder.set_buffer(0, Some(&wq_buf), 0);
+        encoder.set_buffer(1, Some(&wk_buf), 0);
+        encoder.set_buffer(2, Some(&wv_buf), 0);
+        encoder.set_buffer(3, Some(&x_buf), 0);
+        encoder.set_buffer(4, Some(&q_buf), 0);
+        encoder.set_buffer(5, Some(&k_buf), 0);
+        encoder.set_buffer(6, Some(&v_buf), 0);
+        encoder.set_bytes(7, 4, &q_dim_u32 as *const u32 as *const _);
+        encoder.set_bytes(8, 4, &kv_dim_u32 as *const u32 as *const _);
+        encoder.set_bytes(9, 4, &n_embd_u32 as *const u32 as *const _);
+
+        let threads = MTLSize::new(total_out as u64, 1, 1);
+        let tg = MTLSize::new(
+            self.pipelines
+                .fused_qkv_f32
+                .max_total_threads_per_threadgroup()
+                .min(total_out as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(threads, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let q = self.read_buffer::<f32>(&q_buf, q_dim);
+        let k = self.read_buffer::<f32>(&k_buf, kv_dim);
+        let v = self.read_buffer::<f32>(&v_buf, kv_dim);
+        (q, k, v)
+    }
+
+    /// Fused QKV projection + RoPE in a single GPU dispatch.
+    /// Computes Q = Wq·x, K = Wk·x, V = Wv·x, then applies RoPE to Q and K.
+    /// Returns (Q_rope, K_rope, V) — ready for attention computation.
+    #[cfg(target_os = "macos")]
+    pub fn fused_qkv_rope_f32(
+        &self,
+        wq: &[f32],
+        wk: &[f32],
+        wv: &[f32],
+        x: &[f32],
+        q_dim: usize,
+        kv_dim: usize,
+        n_embd: usize,
+        head_dim: usize,
+        position: usize,
+        theta_base: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let total_out = q_dim + kv_dim + kv_dim;
+
+        // Don't use GPU for small projections
+        if total_out * n_embd < MIN_GPU_ELEMENTS {
+            let mut q = crate::metal::compute::matvec_f32_simd(wq, x, q_dim, n_embd);
+            let mut k = crate::metal::compute::matvec_f32_simd(wk, x, kv_dim, n_embd);
+            let v = crate::metal::compute::matvec_f32_simd(wv, x, kv_dim, n_embd);
+            // Apply RoPE on CPU for small tensors
+            let n_head_q = q_dim / head_dim;
+            let n_head_kv = kv_dim / head_dim;
+            crate::metal::compute::rope_f32_multi_head(
+                &mut q, head_dim, n_head_q, position, theta_base,
+            );
+            crate::metal::compute::rope_f32_multi_head(
+                &mut k, head_dim, n_head_kv, position, theta_base,
+            );
+            return (q, k, v);
+        }
+
+        let opts = MTLResourceOptions::StorageModeShared;
+
+        let wq_buf =
+            self.device
+                .new_buffer_with_data(wq.as_ptr() as *const _, (wq.len() * 4) as u64, opts);
+        let wk_buf =
+            self.device
+                .new_buffer_with_data(wk.as_ptr() as *const _, (wk.len() * 4) as u64, opts);
+        let wv_buf =
+            self.device
+                .new_buffer_with_data(wv.as_ptr() as *const _, (wv.len() * 4) as u64, opts);
+        let x_buf =
+            self.device
+                .new_buffer_with_data(x.as_ptr() as *const _, (x.len() * 4) as u64, opts);
+        let q_buf = self.device.new_buffer((q_dim * 4) as u64, opts);
+        let k_buf = self.device.new_buffer((kv_dim * 4) as u64, opts);
+        let v_buf = self.device.new_buffer((kv_dim * 4) as u64, opts);
+
+        // Pack params: q_dim, kv_dim, n_embd, head_dim, position, theta_base_bits
+        let params: [u32; 6] = [
+            q_dim as u32,
+            kv_dim as u32,
+            n_embd as u32,
+            head_dim as u32,
+            position as u32,
+            theta_base.to_bits(),
+        ];
+        let params_buf = self.device.new_buffer_with_data(
+            params.as_ptr() as *const _,
+            (params.len() * 4) as u64,
+            opts,
+        );
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.fused_qkv_rope_f32);
+        encoder.set_buffer(0, Some(&wq_buf), 0);
+        encoder.set_buffer(1, Some(&wk_buf), 0);
+        encoder.set_buffer(2, Some(&wv_buf), 0);
+        encoder.set_buffer(3, Some(&x_buf), 0);
+        encoder.set_buffer(4, Some(&q_buf), 0);
+        encoder.set_buffer(5, Some(&k_buf), 0);
+        encoder.set_buffer(6, Some(&v_buf), 0);
+        encoder.set_buffer(7, Some(&params_buf), 0);
+
+        let threads = MTLSize::new(total_out as u64, 1, 1);
+        let tg = MTLSize::new(
+            self.pipelines
+                .fused_qkv_rope_f32
+                .max_total_threads_per_threadgroup()
+                .min(total_out as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(threads, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let q = self.read_buffer::<f32>(&q_buf, q_dim);
+        let k = self.read_buffer::<f32>(&k_buf, kv_dim);
+        let v = self.read_buffer::<f32>(&v_buf, kv_dim);
+        (q, k, v)
+    }
+
+    /// Fused post-attention residual add + FFN RMSNorm.
+    ///
+    /// Performs: hidden[i] += attn[i], then ffn_out = rmsnorm(hidden) * weight
+    /// in two GPU dispatches within a single logical operation.
+    /// Eliminates the hidden_state clone + separate RMSNorm dispatch.
+    /// Returns the normalized FFN input; hidden_state is updated in-place.
+    #[cfg(target_os = "macos")]
+    pub fn fused_post_attn_norm_f32(
+        &self,
+        hidden: &mut [f32],
+        attn_output: &[f32],
+        norm_weight: &[f32],
+        eps: f32,
+    ) -> Vec<f32> {
+        let n = hidden.len();
+        debug_assert_eq!(n, attn_output.len());
+        debug_assert_eq!(n, norm_weight.len());
+
+        // Phase 1: residual add + partial sum-of-squares
+        let hidden_buf = self.create_buffer_with_data(hidden);
+        let attn_buf = self.create_buffer_with_data(attn_output);
+        let n_threads = 256usize;
+        let partial_buf = self.create_buffer::<f32>(n_threads);
+        let n_buf = self.create_buffer_with_data(&[n as u32]);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.fused_post_attn_norm_sumsq);
+        encoder.set_buffer(0, Some(&hidden_buf), 0);
+        encoder.set_buffer(1, Some(&attn_buf), 0);
+        encoder.set_buffer(2, Some(&partial_buf), 0);
+        encoder.set_buffer(3, Some(&n_buf), 0);
+        let tg = MTLSize::new(n_threads as u64, 1, 1);
+        encoder.dispatch_threads(tg, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // CPU reduction of partial sums
+        let partials = self.read_buffer::<f32>(&partial_buf, n_threads);
+        let sum_sq: f32 = partials.iter().sum();
+        let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+
+        // Phase 2: produce normalized FFN input (hidden unchanged)
+        let weight_buf = self.create_buffer_with_data(norm_weight);
+        let inv_rms_buf = self.create_buffer_with_data(&[inv_rms]);
+        let ffn_buf = self.create_buffer::<f32>(n);
+
+        let cmd = self.queue.new_command_buffer();
+        let encoder = cmd.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipelines.fused_post_attn_norm_apply);
+        encoder.set_buffer(0, Some(&hidden_buf), 0);
+        encoder.set_buffer(1, Some(&weight_buf), 0);
+        encoder.set_buffer(2, Some(&ffn_buf), 0);
+        encoder.set_buffer(3, Some(&inv_rms_buf), 0);
+        encoder.set_buffer(4, Some(&n_buf), 0);
+        let threads = MTLSize::new(n as u64, 1, 1);
+        let tg = MTLSize::new(
+            (self
+                .pipelines
+                .fused_post_attn_norm_apply
+                .max_total_threads_per_threadgroup())
+            .min(n as u64),
+            1,
+            1,
+        );
+        encoder.dispatch_threads(threads, tg);
+        encoder.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        // Read back updated hidden state and FFN input
+        let updated_hidden = self.read_buffer::<f32>(&hidden_buf, n);
+        hidden.copy_from_slice(&updated_hidden);
+
+        self.read_buffer::<f32>(&ffn_buf, n)
+    }
+
+    /// Fused RMSNorm + Output Projection: logits = W_out × rmsnorm(hidden_state)
+    /// Two GPU dispatches (inv_rms computation + fused norm+matmul) but only one
+    /// round-trip, eliminating the intermediate normalized hidden state buffer.
+    #[cfg(target_os = "macos")]
+    pub fn fused_rmsnorm_linear_f32(
+        &self,
+        x: &[f32],
+        norm_weight: &[f32],
+        out_weight: &[f32],
+        vocab_size: usize,
+        n_embd: usize,
+    ) -> Vec<f32> {
+        let opts = MTLResourceOptions::StorageModeShared;
+
+        let x_buf =
+            self.device
+                .new_buffer_with_data(x.as_ptr() as *const _, (x.len() * 4) as u64, opts);
+        let nw_buf = self.device.new_buffer_with_data(
+            norm_weight.as_ptr() as *const _,
+            (norm_weight.len() * 4) as u64,
+            opts,
+        );
+        let ow_buf = self.device.new_buffer_with_data(
+            out_weight.as_ptr() as *const _,
+            (out_weight.len() * 4) as u64,
+            opts,
+        );
+        let logits_buf = self.device.new_buffer((vocab_size * 4) as u64, opts);
+        let rms_buf = self.device.new_buffer(4u64, opts);
+
+        let n_embd_u32 = n_embd as u32;
+        let vocab_u32 = vocab_size as u32;
+        let eps: f32 = 1e-5;
+
+        let cmd = self.queue.new_command_buffer();
+
+        // Phase 1: Compute inv_rms (single thread)
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.pipelines.compute_inv_rms);
+            enc.set_buffer(0, Some(&x_buf), 0);
+            enc.set_buffer(1, Some(&rms_buf), 0);
+            enc.set_bytes(2, 4, &n_embd_u32 as *const u32 as *const _);
+            enc.set_bytes(3, 4, &eps as *const f32 as *const _);
+            enc.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            enc.end_encoding();
+        }
+
+        // Phase 2: Fused norm + projection (one thread per vocab entry)
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.pipelines.fused_rmsnorm_linear_f32);
+            enc.set_buffer(0, Some(&x_buf), 0);
+            enc.set_buffer(1, Some(&nw_buf), 0);
+            enc.set_buffer(2, Some(&ow_buf), 0);
+            enc.set_buffer(3, Some(&logits_buf), 0);
+            enc.set_bytes(4, 4, &vocab_u32 as *const u32 as *const _);
+            enc.set_bytes(5, 4, &n_embd_u32 as *const u32 as *const _);
+            enc.set_bytes(6, 4, &eps as *const f32 as *const _);
+            enc.set_buffer(7, Some(&rms_buf), 0);
+
+            let threads = MTLSize::new(vocab_size as u64, 1, 1);
+            let tg = MTLSize::new(
+                self.pipelines
+                    .fused_rmsnorm_linear_f32
+                    .max_total_threads_per_threadgroup()
+                    .min(vocab_size as u64),
+                1,
+                1,
+            );
+            enc.dispatch_threads(threads, tg);
+            enc.end_encoding();
+        }
+
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        self.read_buffer::<f32>(&logits_buf, vocab_size)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_buffer<T: Copy>(&self, buffer: &Buffer, count: usize) -> Vec<T> {
+        let ptr = buffer.contents() as *const T;
+        let slice = unsafe { std::slice::from_raw_parts(ptr, count) };
+        slice.to_vec()
+    }
+}

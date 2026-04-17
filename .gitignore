@@ -1,0 +1,12 @@
+/target
+/target-release
+/target2
+/target3
+/target4
+/target*/
+Cargo.lock
+*.gguf
+*.bin
+.DS_Store
+llama_cpp_*.bin
+ssd_llm_*.bin
