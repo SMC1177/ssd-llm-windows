@@ -1,0 +1,585 @@
+//! Disk-backed `Store` — vectors in `vectors.bin`, chunks in `chunks.jsonl`,
+//! metadata in `manifest.json`. Single-directory layout so one index is one
+//! folder on the SSD.
+//!
+//! v1 keeps the live working set in RAM (`Vec<f32>` of vectors, `Vec<Chunk>`
+//! of chunks, a `HashMap` for id lookup) and flushes whole files to disk on
+//! demand or on drop. The trait is the stable contract; when indexes get
+//! large enough to need actual mmap-backed row access, the internals swap
+//! without changing any caller code.
+
+use crate::{Chunk, Embedder, Hit, Store};
+use anyhow::{anyhow, Context};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_FILE: &str = "manifest.json";
+const VECTORS_FILE: &str = "vectors.bin";
+const CHUNKS_FILE: &str = "chunks.jsonl";
+
+#[derive(Serialize, Deserialize)]
+struct Manifest {
+    version: u32,
+    dim: usize,
+    tag: String,
+    count: usize,
+}
+
+/// Disk-backed vector store. One instance == one directory on the SSD.
+#[derive(Debug)]
+pub struct FileStore {
+    dir: PathBuf,
+    dim: usize,
+    tag: String,
+    /// Contiguous row-major vectors: chunk i lives at vectors[i*dim .. (i+1)*dim].
+    /// Always L2-normalized so cosine similarity reduces to dot product.
+    vectors: Vec<f32>,
+    chunks: Vec<Chunk>,
+    chunk_index: HashMap<String, usize>,
+    dirty: bool,
+}
+
+impl FileStore {
+    /// Create a new empty store at `dir` (directory is created if missing).
+    /// `tag` should be the exact `Embedder::tag()` value of the embedder
+    /// whose vectors will be written here. Queries using any other tag
+    /// will be rejected at `open` time.
+    pub fn create(dir: impl Into<PathBuf>, dim: usize, tag: impl Into<String>) -> anyhow::Result<Self> {
+        let dir = dir.into();
+        let tag = tag.into();
+        if dim == 0 {
+            return Err(anyhow!("dim must be > 0"));
+        }
+        fs::create_dir_all(&dir).with_context(|| format!("create_dir_all {}", dir.display()))?;
+        let store = Self {
+            dir,
+            dim,
+            tag,
+            vectors: Vec::new(),
+            chunks: Vec::new(),
+            chunk_index: HashMap::new(),
+            dirty: true,
+        };
+        store.write_manifest(0)?;
+        Ok(store)
+    }
+
+    /// Open an existing store at `dir`. Verifies `expected_dim` and
+    /// `expected_tag` against the on-disk manifest — mismatched values
+    /// return an error rather than silently producing garbage hits.
+    pub fn open(
+        dir: impl Into<PathBuf>,
+        expected_dim: usize,
+        expected_tag: &str,
+    ) -> anyhow::Result<Self> {
+        let dir = dir.into();
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let manifest_text = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read manifest {}", manifest_path.display()))?;
+        let manifest: Manifest =
+            serde_json::from_str(&manifest_text).context("parse manifest.json")?;
+
+        if manifest.version != MANIFEST_VERSION {
+            return Err(anyhow!(
+                "unsupported manifest version {} (expected {})",
+                manifest.version,
+                MANIFEST_VERSION
+            ));
+        }
+        if manifest.dim != expected_dim {
+            return Err(anyhow!(
+                "dim mismatch: on-disk {} vs expected {}",
+                manifest.dim,
+                expected_dim
+            ));
+        }
+        if manifest.tag != expected_tag {
+            return Err(anyhow!(
+                "tag mismatch: on-disk {:?} vs expected {:?}",
+                manifest.tag,
+                expected_tag
+            ));
+        }
+
+        let vectors = read_vectors_bin(&dir.join(VECTORS_FILE), manifest.count, manifest.dim)?;
+        let chunks = read_chunks_jsonl(&dir.join(CHUNKS_FILE))?;
+        if chunks.len() != manifest.count {
+            return Err(anyhow!(
+                "chunks.jsonl has {} lines but manifest says count={}",
+                chunks.len(),
+                manifest.count
+            ));
+        }
+        let mut chunk_index = HashMap::with_capacity(chunks.len());
+        for (i, c) in chunks.iter().enumerate() {
+            if chunk_index.insert(c.id.clone(), i).is_some() {
+                return Err(anyhow!("duplicate chunk id {} in chunks.jsonl", c.id));
+            }
+        }
+
+        Ok(Self {
+            dir,
+            dim: manifest.dim,
+            tag: manifest.tag,
+            vectors,
+            chunks,
+            chunk_index,
+            dirty: false,
+        })
+    }
+
+    /// Open an existing store at `dir`, or create a new empty one if the
+    /// manifest is missing. The expected embedder identity must always
+    /// match when the manifest does exist.
+    pub fn open_or_create(
+        dir: impl Into<PathBuf>,
+        expected_dim: usize,
+        expected_tag: &str,
+    ) -> anyhow::Result<Self> {
+        let dir = dir.into();
+        if dir.join(MANIFEST_FILE).exists() {
+            Self::open(dir, expected_dim, expected_tag)
+        } else {
+            Self::create(dir, expected_dim, expected_tag.to_string())
+        }
+    }
+
+    /// Convenience: create/open the store that matches a given embedder.
+    pub fn for_embedder<E: Embedder>(dir: impl Into<PathBuf>, e: &E) -> anyhow::Result<Self> {
+        Self::open_or_create(dir, e.dim(), e.tag())
+    }
+
+    /// Explicitly write vectors + chunks + manifest to disk. Clears dirty.
+    pub fn flush(&mut self) -> anyhow::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        write_vectors_bin(&self.dir.join(VECTORS_FILE), &self.vectors)?;
+        write_chunks_jsonl(&self.dir.join(CHUNKS_FILE), &self.chunks)?;
+        self.write_manifest(self.chunks.len())?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn write_manifest(&self, count: usize) -> anyhow::Result<()> {
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            dim: self.dim,
+            tag: self.tag.clone(),
+            count,
+        };
+        let path = self.dir.join(MANIFEST_FILE);
+        let s = serde_json::to_string_pretty(&manifest).context("serialize manifest")?;
+        fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+}
+
+impl Drop for FileStore {
+    fn drop(&mut self) {
+        // Best-effort flush on drop. Errors are logged but must not panic
+        // through drop (would poison program shutdown). Callers who need
+        // hard persistence guarantees should call .flush() explicitly and
+        // handle the Result.
+        if self.dirty {
+            if let Err(e) = self.flush() {
+                tracing::warn!(
+                    "FileStore drop: flush failed for {}: {:#}",
+                    self.dir.display(),
+                    e
+                );
+            }
+        }
+    }
+}
+
+impl Store for FileStore {
+    fn put(&mut self, chunk: &Chunk, vector: &[f32]) -> anyhow::Result<()> {
+        if vector.len() != self.dim {
+            return Err(anyhow!(
+                "put: vector dim {} != store dim {}",
+                vector.len(),
+                self.dim
+            ));
+        }
+        if self.chunk_index.contains_key(&chunk.id) {
+            return Err(anyhow!("duplicate chunk id: {}", chunk.id));
+        }
+        let mut v = vector.to_vec();
+        l2_normalize(&mut v);
+        let idx = self.chunks.len();
+        self.vectors.extend_from_slice(&v);
+        self.chunks.push(chunk.clone());
+        self.chunk_index.insert(chunk.id.clone(), idx);
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn query(&self, query: &[f32], top_k: usize) -> anyhow::Result<Vec<Hit>> {
+        if query.len() != self.dim {
+            return Err(anyhow!(
+                "query: vector dim {} != store dim {}",
+                query.len(),
+                self.dim
+            ));
+        }
+        if top_k == 0 || self.chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut q = query.to_vec();
+        l2_normalize(&mut q);
+
+        let mut scored: Vec<(usize, f32)> = Vec::with_capacity(self.chunks.len());
+        for i in 0..self.chunks.len() {
+            let start = i * self.dim;
+            let end = start + self.dim;
+            let row = &self.vectors[start..end];
+            let dot: f32 = q.iter().zip(row).map(|(a, b)| a * b).sum();
+            scored.push((i, dot));
+        }
+        // Highest score first; NaN sinks to end rather than crashing the sort.
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(top_k);
+        Ok(scored
+            .into_iter()
+            .map(|(i, score)| Hit {
+                chunk_id: self.chunks[i].id.clone(),
+                score,
+            })
+            .collect())
+    }
+
+    fn get_chunk(&self, chunk_id: &str) -> anyhow::Result<Option<Chunk>> {
+        Ok(self
+            .chunk_index
+            .get(chunk_id)
+            .map(|&i| self.chunks[i].clone()))
+    }
+
+    fn len(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
+fn l2_normalize(v: &mut [f32]) {
+    let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+    let norm = norm_sq.sqrt();
+    if norm > 0.0 && norm.is_finite() {
+        let inv = 1.0 / norm;
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
+    // If norm is zero or non-finite we leave the vector as-is. Querying
+    // with a zero vector returns 0-score hits which is semantically honest
+    // (no similarity signal).
+}
+
+fn write_vectors_bin(path: &Path, vectors: &[f32]) -> anyhow::Result<()> {
+    let f = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut w = BufWriter::new(f);
+    let mut buf = [0u8; 4];
+    for &v in vectors {
+        buf.copy_from_slice(&v.to_le_bytes());
+        w.write_all(&buf)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    w.flush().with_context(|| format!("flush {}", path.display()))?;
+    Ok(())
+}
+
+fn read_vectors_bin(path: &Path, count: usize, dim: usize) -> anyhow::Result<Vec<f32>> {
+    if count == 0 {
+        if path.exists() {
+            // Allow empty or missing vectors.bin when count is zero.
+        }
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let expected = count
+        .checked_mul(dim)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| anyhow!("count*dim*4 overflows"))?;
+    if bytes.len() != expected {
+        return Err(anyhow!(
+            "vectors.bin size {} != count*dim*4 {} (count={}, dim={})",
+            bytes.len(),
+            expected,
+            count,
+            dim
+        ));
+    }
+    let mut out = Vec::with_capacity(count * dim);
+    for chunk in bytes.chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().expect("chunks_exact yields 4-byte slices");
+        out.push(f32::from_le_bytes(arr));
+    }
+    Ok(out)
+}
+
+fn write_chunks_jsonl(path: &Path, chunks: &[Chunk]) -> anyhow::Result<()> {
+    let f = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut w = BufWriter::new(f);
+    for chunk in chunks {
+        let s = serde_json::to_string(chunk)
+            .with_context(|| format!("serialize chunk {}", chunk.id))?;
+        w.write_all(s.as_bytes())
+            .with_context(|| format!("write chunk to {}", path.display()))?;
+        w.write_all(b"\n")
+            .with_context(|| format!("write newline to {}", path.display()))?;
+    }
+    w.flush().with_context(|| format!("flush {}", path.display()))?;
+    Ok(())
+}
+
+fn read_chunks_jsonl(path: &Path) -> anyhow::Result<Vec<Chunk>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let r = BufReader::new(f);
+    let mut out = Vec::new();
+    for (lineno, line) in r.lines().enumerate() {
+        let line = line.with_context(|| format!("read line {} of {}", lineno + 1, path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let chunk: Chunk = serde_json::from_str(&line)
+            .with_context(|| format!("parse line {} of {}", lineno + 1, path.display()))?;
+        out.push(chunk);
+    }
+    Ok(out)
+}
+
+/// Ensure write_to_disk path doesn't silently drop file handles. Used by
+/// `OpenOptions::append` callers in future incremental-write modes.
+#[allow(dead_code)]
+fn open_append(path: &Path) -> anyhow::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open append {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{embed::OllamaEmbedder, Retriever};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Process-local temp directory helper. Each test gets its own
+    /// subdirectory so they can run in parallel without stepping on each
+    /// other's files.
+    fn tmpdir(label: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let base = std::env::temp_dir()
+            .join("ssd-index-tests")
+            .join(format!("{}-{}-{}", label, pid, n));
+        let _ = fs::remove_dir_all(&base);
+        base
+    }
+
+    fn chunk(id: &str, text: &str) -> Chunk {
+        Chunk {
+            id: id.to_string(),
+            text: text.to_string(),
+            path: "fixture.txt".to_string(),
+            offset: 0,
+            len: text.len(),
+            lang: None,
+        }
+    }
+
+    #[test]
+    fn create_then_reopen_round_trips_state() {
+        let dir = tmpdir("round_trip");
+        let tag = "test:unit";
+        {
+            let mut s = FileStore::create(&dir, 3, tag).unwrap();
+            s.put(&chunk("a", "alpha"), &[1.0, 0.0, 0.0]).unwrap();
+            s.put(&chunk("b", "beta"), &[0.0, 1.0, 0.0]).unwrap();
+            s.flush().unwrap();
+        } // drop closes the store
+        let reopened = FileStore::open(&dir, 3, tag).unwrap();
+        assert_eq!(reopened.len(), 2);
+        let got_a = reopened.get_chunk("a").unwrap().expect("a present");
+        assert_eq!(got_a.text, "alpha");
+        let got_b = reopened.get_chunk("b").unwrap().expect("b present");
+        assert_eq!(got_b.text, "beta");
+    }
+
+    #[test]
+    fn tag_mismatch_on_open_errors() {
+        let dir = tmpdir("tag_mismatch");
+        {
+            let mut s = FileStore::create(&dir, 2, "model-A").unwrap();
+            s.put(&chunk("x", "x"), &[1.0, 0.0]).unwrap();
+            s.flush().unwrap();
+        }
+        let err = FileStore::open(&dir, 2, "model-B").unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("tag mismatch"),
+            "expected tag-mismatch error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn dim_mismatch_on_open_errors() {
+        let dir = tmpdir("dim_mismatch_open");
+        {
+            let mut s = FileStore::create(&dir, 4, "model-A").unwrap();
+            s.put(&chunk("x", "x"), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            s.flush().unwrap();
+        }
+        let err = FileStore::open(&dir, 8, "model-A").unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("dim mismatch"),
+            "expected dim-mismatch error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn dim_mismatch_on_put_errors() {
+        let dir = tmpdir("dim_mismatch_put");
+        let mut s = FileStore::create(&dir, 3, "t").unwrap();
+        let err = s.put(&chunk("x", "x"), &[1.0, 0.0]).unwrap_err();
+        assert!(format!("{:#}", err).contains("vector dim"));
+    }
+
+    #[test]
+    fn query_returns_top_k_sorted_desc() {
+        let dir = tmpdir("topk_sorted");
+        let mut s = FileStore::create(&dir, 3, "t").unwrap();
+        s.put(&chunk("near", "near"), &[1.0, 0.0, 0.0]).unwrap();
+        s.put(&chunk("mid", "mid"), &[0.5, 0.5, 0.0]).unwrap();
+        s.put(&chunk("far", "far"), &[0.0, 1.0, 0.0]).unwrap();
+
+        let hits = s.query(&[1.0, 0.0, 0.0], 3).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].chunk_id, "near", "highest score first");
+        assert_eq!(hits[1].chunk_id, "mid");
+        assert_eq!(hits[2].chunk_id, "far");
+        assert!(hits[0].score >= hits[1].score);
+        assert!(hits[1].score >= hits[2].score);
+    }
+
+    #[test]
+    fn cosine_orthogonality_and_identity() {
+        let dir = tmpdir("cos");
+        let mut s = FileStore::create(&dir, 3, "t").unwrap();
+        s.put(&chunk("x", "x"), &[1.0, 0.0, 0.0]).unwrap();
+        s.put(&chunk("y", "y"), &[0.0, 1.0, 0.0]).unwrap();
+
+        let hits = s.query(&[1.0, 0.0, 0.0], 2).unwrap();
+        let score_of = |id: &str| hits.iter().find(|h| h.chunk_id == id).unwrap().score;
+        assert!(
+            (score_of("x") - 1.0).abs() < 1e-5,
+            "self-similarity should be ~1.0, got {}",
+            score_of("x")
+        );
+        assert!(
+            score_of("y").abs() < 1e-5,
+            "orthogonal vectors should score ~0.0, got {}",
+            score_of("y")
+        );
+    }
+
+    #[test]
+    fn duplicate_chunk_id_errors() {
+        let dir = tmpdir("dup_id");
+        let mut s = FileStore::create(&dir, 2, "t").unwrap();
+        s.put(&chunk("same", "first"), &[1.0, 0.0]).unwrap();
+        let err = s.put(&chunk("same", "second"), &[0.0, 1.0]).unwrap_err();
+        assert!(format!("{:#}", err).contains("duplicate chunk id"));
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn query_on_empty_store_returns_empty() {
+        let dir = tmpdir("empty_q");
+        let s = FileStore::create(&dir, 3, "t").unwrap();
+        let hits = s.query(&[1.0, 0.0, 0.0], 5).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn top_k_zero_returns_empty_even_with_data() {
+        let dir = tmpdir("topk_zero");
+        let mut s = FileStore::create(&dir, 2, "t").unwrap();
+        s.put(&chunk("a", "a"), &[1.0, 0.0]).unwrap();
+        let hits = s.query(&[1.0, 0.0], 0).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn top_k_greater_than_n_returns_all() {
+        let dir = tmpdir("topk_big");
+        let mut s = FileStore::create(&dir, 2, "t").unwrap();
+        s.put(&chunk("a", "a"), &[1.0, 0.0]).unwrap();
+        s.put(&chunk("b", "b"), &[0.0, 1.0]).unwrap();
+        let hits = s.query(&[1.0, 0.0], 100).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    /// Seam test: FileStore plugs into Retriever alongside OllamaEmbedder.
+    /// Compile-time bound proof — no Ollama daemon needed.
+    #[test]
+    fn file_store_plugs_into_retriever_with_ollama() {
+        let dir = tmpdir("retriever_seam");
+        let e = OllamaEmbedder::nomic_embed_text().unwrap();
+        let s = FileStore::create(&dir, e.dim(), e.tag()).unwrap();
+        let _r: Retriever<OllamaEmbedder, FileStore> = Retriever::new(e, s);
+        // If the generic instantiation compiles, the seam holds.
+    }
+
+    #[test]
+    fn drop_flushes_dirty_state() {
+        let dir = tmpdir("drop_flush");
+        {
+            let mut s = FileStore::create(&dir, 2, "t").unwrap();
+            s.put(&chunk("a", "alpha"), &[1.0, 0.0]).unwrap();
+            // NOTE: deliberately no explicit flush — rely on Drop
+        }
+        let reopened = FileStore::open(&dir, 2, "t").unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(
+            reopened.get_chunk("a").unwrap().unwrap().text,
+            "alpha"
+        );
+    }
+
+    #[test]
+    fn corrupt_vectors_bin_size_rejected() {
+        let dir = tmpdir("corrupt_size");
+        {
+            let mut s = FileStore::create(&dir, 3, "t").unwrap();
+            s.put(&chunk("a", "a"), &[1.0, 0.0, 0.0]).unwrap();
+            s.flush().unwrap();
+        }
+        // Truncate vectors.bin by 1 byte to force size mismatch.
+        let vec_path = dir.join(VECTORS_FILE);
+        let bytes = fs::read(&vec_path).unwrap();
+        fs::write(&vec_path, &bytes[..bytes.len() - 1]).unwrap();
+
+        let err = FileStore::open(&dir, 3, "t").unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("vectors.bin size"),
+            "expected size-mismatch error, got: {}",
+            msg
+        );
+    }
+}

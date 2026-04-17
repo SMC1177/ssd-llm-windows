@@ -9,6 +9,7 @@
 //! lives on SSD with the same streaming discipline as model weights.
 
 pub mod embed;
+pub mod store;
 
 use serde::{Deserialize, Serialize};
 
