@@ -8,6 +8,7 @@
 //! The v1 storage target is mmap-backed `.bin` files so the index itself
 //! lives on SSD with the same streaming discipline as model weights.
 
+pub mod chunk;
 pub mod embed;
 pub mod store;
 

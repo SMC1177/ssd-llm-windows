@@ -198,6 +198,11 @@ impl Drop for FileStore {
 }
 
 impl Store for FileStore {
+    /// Upsert semantics. If a chunk with the same ID already exists, the
+    /// stored vector and chunk metadata are overwritten in place (no grow).
+    /// If new, the chunk is appended. This makes reindexing idempotent —
+    /// unchanged files produce same-id chunks, so re-putting them is a
+    /// zero-net-effect operation on the store's size.
     fn put(&mut self, chunk: &Chunk, vector: &[f32]) -> anyhow::Result<()> {
         if vector.len() != self.dim {
             return Err(anyhow!(
@@ -206,15 +211,21 @@ impl Store for FileStore {
                 self.dim
             ));
         }
-        if self.chunk_index.contains_key(&chunk.id) {
-            return Err(anyhow!("duplicate chunk id: {}", chunk.id));
-        }
         let mut v = vector.to_vec();
         l2_normalize(&mut v);
-        let idx = self.chunks.len();
-        self.vectors.extend_from_slice(&v);
-        self.chunks.push(chunk.clone());
-        self.chunk_index.insert(chunk.id.clone(), idx);
+
+        if let Some(&idx) = self.chunk_index.get(&chunk.id) {
+            // Upsert: overwrite vector slice and chunk record in place.
+            let start = idx * self.dim;
+            let end = start + self.dim;
+            self.vectors[start..end].copy_from_slice(&v);
+            self.chunks[idx] = chunk.clone();
+        } else {
+            let idx = self.chunks.len();
+            self.vectors.extend_from_slice(&v);
+            self.chunks.push(chunk.clone());
+            self.chunk_index.insert(chunk.id.clone(), idx);
+        }
         self.dirty = true;
         Ok(())
     }
@@ -498,13 +509,74 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_chunk_id_errors() {
-        let dir = tmpdir("dup_id");
+    fn put_same_id_twice_upserts_not_errors() {
+        let dir = tmpdir("upsert_basic");
         let mut s = FileStore::create(&dir, 2, "t").unwrap();
         s.put(&chunk("same", "first"), &[1.0, 0.0]).unwrap();
-        let err = s.put(&chunk("same", "second"), &[0.0, 1.0]).unwrap_err();
-        assert!(format!("{:#}", err).contains("duplicate chunk id"));
-        assert_eq!(s.len(), 1);
+        s.put(&chunk("same", "second"), &[0.0, 1.0])
+            .expect("upsert must not error on id collision");
+        assert_eq!(s.len(), 1, "upsert must not grow the store");
+        assert_eq!(
+            s.get_chunk("same").unwrap().unwrap().text,
+            "second",
+            "upsert replaces chunk metadata with the new value"
+        );
+    }
+
+    #[test]
+    fn upsert_actually_replaces_stored_vector() {
+        let dir = tmpdir("upsert_vec");
+        let mut s = FileStore::create(&dir, 2, "t").unwrap();
+        s.put(&chunk("x", "x"), &[1.0, 0.0]).unwrap();
+
+        // Before: x points along [1,0], so query [1,0] gives ~1.0 self-similarity.
+        let before_score = s
+            .query(&[1.0, 0.0], 1)
+            .unwrap()
+            .into_iter()
+            .find(|h| h.chunk_id == "x")
+            .expect("x must be present before upsert")
+            .score;
+        assert!(
+            (before_score - 1.0).abs() < 1e-5,
+            "before upsert, x should self-score ~1.0; got {}",
+            before_score
+        );
+
+        // Upsert x with an orthogonal vector. Same id, different direction.
+        s.put(&chunk("x", "x"), &[0.0, 1.0]).unwrap();
+
+        let after_score = s
+            .query(&[1.0, 0.0], 1)
+            .unwrap()
+            .into_iter()
+            .find(|h| h.chunk_id == "x")
+            .expect("x must still be present after upsert")
+            .score;
+        assert!(
+            after_score.abs() < 1e-5,
+            "after upsert to [0,1], query [1,0] should score ~0.0; got {}",
+            after_score
+        );
+        assert_eq!(s.len(), 1, "upsert must not change store size");
+    }
+
+    #[test]
+    fn upsert_survives_reopen() {
+        let dir = tmpdir("upsert_reopen");
+        {
+            let mut s = FileStore::create(&dir, 2, "t").unwrap();
+            s.put(&chunk("x", "original"), &[1.0, 0.0]).unwrap();
+            s.put(&chunk("x", "updated"), &[0.0, 1.0]).unwrap();
+            s.flush().unwrap();
+        }
+        let reopened = FileStore::open(&dir, 2, "t").unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(
+            reopened.get_chunk("x").unwrap().unwrap().text,
+            "updated",
+            "upsert must be persisted across open/close cycles"
+        );
     }
 
     #[test]
