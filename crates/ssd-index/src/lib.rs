@@ -11,6 +11,10 @@
 pub mod chunk;
 pub mod embed;
 pub mod store;
+pub mod walk;
+
+pub use chunk::Chunker;
+pub use walk::{index_directory, IndexReport, Walker};
 
 use serde::{Deserialize, Serialize};
 
