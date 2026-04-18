@@ -327,6 +327,41 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         init: bool,
     },
+
+    /// Build or update a semantic index over a directory tree.
+    /// Respects .gitignore inside git repos and .ignore anywhere. Uses a
+    /// local Ollama daemon with `nomic-embed-text` for embeddings.
+    Index {
+        /// Directory to index (recursive).
+        root: PathBuf,
+
+        /// Where to write the index. Default: <root>/.ssd-index
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
+
+        /// Comma-separated extensions to include (case-insensitive).
+        /// Empty means all text files.
+        #[arg(long, default_value = "")]
+        extensions: String,
+
+        /// Skip files larger than this (bytes). Default 10 MiB.
+        #[arg(long, default_value_t = 10 * 1024 * 1024)]
+        max_bytes: u64,
+    },
+
+    /// Query an existing semantic index and print the top-K matching chunks.
+    Query {
+        /// The question or phrase to match.
+        text: String,
+
+        /// Directory holding the index. Default: ./.ssd-index
+        #[arg(long, default_value = "./.ssd-index")]
+        store_dir: PathBuf,
+
+        /// Number of chunks to return.
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+    },
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1025,6 +1060,102 @@ fn main() -> Result<()> {
                         println!("No config loaded (using defaults): {}", e);
                         println!("Run `ssd-llm config --init` to create one.");
                     }
+                }
+            }
+        }
+
+        Commands::Index {
+            root,
+            store_dir,
+            extensions,
+            max_bytes,
+        } => {
+            use ssd_index::chunk::TextChunker;
+            use ssd_index::embed::OllamaEmbedder;
+            use ssd_index::store::FileStore;
+            use ssd_index::{index_directory, Embedder, Walker};
+
+            if !root.exists() {
+                anyhow::bail!("root not found: {}", root.display());
+            }
+            let store_dir = store_dir.unwrap_or_else(|| root.join(".ssd-index"));
+
+            let exts: Vec<String> = extensions
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let embedder = OllamaEmbedder::nomic_embed_text()?;
+            let mut store = FileStore::open_or_create(&store_dir, embedder.dim(), embedder.tag())?;
+
+            let chunker = TextChunker::default_code();
+            let mut walker = Walker::default_code();
+            walker.max_file_bytes = max_bytes;
+            if !exts.is_empty() {
+                walker = walker.with_extensions(exts);
+            }
+
+            println!("Indexing {} → {}", root.display(), store_dir.display());
+            let report = index_directory(&root, &walker, &chunker, &embedder, &mut store)?;
+            store.flush()?;
+
+            println!(
+                "files visited={}, indexed={}, skipped={}, chunks_put={}",
+                report.files_visited, report.files_indexed, report.files_skipped, report.chunks_put
+            );
+            if !report.errors.is_empty() {
+                println!("errors ({}):", report.errors.len());
+                for (p, e) in report.errors.iter().take(20) {
+                    println!("  {}: {}", p.display(), e);
+                }
+                if report.errors.len() > 20 {
+                    println!("  ... and {} more", report.errors.len() - 20);
+                }
+            }
+        }
+
+        Commands::Query {
+            text,
+            store_dir,
+            top_k,
+        } => {
+            use ssd_index::embed::OllamaEmbedder;
+            use ssd_index::store::FileStore;
+            use ssd_index::{Embedder, Store};
+
+            if !store_dir.exists() {
+                anyhow::bail!(
+                    "store dir does not exist: {}. Run `ssd-llm index <root>` first.",
+                    store_dir.display()
+                );
+            }
+
+            let embedder = OllamaEmbedder::nomic_embed_text()?;
+            let store = FileStore::open(&store_dir, embedder.dim(), embedder.tag())?;
+
+            let q = embedder.embed(&text)?;
+            let hits = store.query(&q, top_k)?;
+
+            if hits.is_empty() {
+                println!("no results");
+            }
+            for (i, hit) in hits.iter().enumerate() {
+                let chunk = store
+                    .get_chunk(&hit.chunk_id)?
+                    .ok_or_else(|| anyhow::anyhow!("hit {} missing chunk", hit.chunk_id))?;
+                println!(
+                    "[{}] score={:.4} {}:{}",
+                    i + 1,
+                    hit.score,
+                    chunk.path,
+                    chunk.offset
+                );
+                // Print a preview. Truncate long chunks to keep CLI output scannable.
+                let preview: String = chunk.text.chars().take(300).collect();
+                println!("    {}", preview.replace('\n', "\n    "));
+                if chunk.text.len() > 300 {
+                    println!("    ... ({} more bytes)", chunk.text.len() - 300);
                 }
             }
         }

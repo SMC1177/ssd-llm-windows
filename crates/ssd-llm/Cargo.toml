@@ -25,6 +25,7 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
+ssd-index = { path = "../ssd-index" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.29"
