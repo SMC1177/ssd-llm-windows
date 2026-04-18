@@ -26,6 +26,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 ssd-index = { path = "../ssd-index" }
+axum = "0.7"
+tower = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.29"

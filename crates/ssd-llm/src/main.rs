@@ -14,7 +14,7 @@ mod model;
 mod pull;
 mod ssd;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -361,6 +361,25 @@ enum Commands {
         /// Number of chunks to return.
         #[arg(long, default_value_t = 5)]
         top_k: usize,
+    },
+
+    /// Serve an existing semantic index over HTTP.
+    /// Read-only: exposes GET /health and POST /query. External callers
+    /// (OpenClaw agents, custom tools, curl) can query without shelling
+    /// out to the ssd-llm CLI per request.
+    ServeIndex {
+        /// Directory holding the index.
+        #[arg(long)]
+        store_dir: PathBuf,
+
+        /// Bind host. Loopback by default — override only if you know
+        /// why (e.g. exposing to other hosts on a trusted LAN).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Bind port.
+        #[arg(long, default_value_t = 37740)]
+        port: u16,
     },
 }
 
@@ -1113,6 +1132,124 @@ fn main() -> Result<()> {
                     println!("  ... and {} more", report.errors.len() - 20);
                 }
             }
+        }
+
+        Commands::ServeIndex {
+            store_dir,
+            host,
+            port,
+        } => {
+            use axum::{
+                extract::State,
+                http::StatusCode,
+                routing::{get, post},
+                Json, Router,
+            };
+            use serde::{Deserialize, Serialize};
+            use ssd_index::embed::OllamaEmbedder;
+            use ssd_index::store::FileStore;
+            use ssd_index::{Embedder, Store};
+            use std::sync::Arc;
+
+            if !store_dir.exists() {
+                anyhow::bail!(
+                    "store dir does not exist: {}. Run `ssd-llm index <root>` first.",
+                    store_dir.display()
+                );
+            }
+
+            let embedder = OllamaEmbedder::nomic_embed_text()?;
+            let store = FileStore::open(&store_dir, embedder.dim(), embedder.tag())?;
+
+            struct ServeState {
+                embedder: OllamaEmbedder,
+                store: FileStore,
+            }
+
+            #[derive(Deserialize)]
+            struct QueryReq {
+                text: String,
+                #[serde(default = "default_top_k")]
+                top_k: usize,
+            }
+            fn default_top_k() -> usize {
+                5
+            }
+
+            #[derive(Serialize)]
+            struct QueryHit {
+                chunk_id: String,
+                score: f32,
+                path: String,
+                offset: usize,
+                text: String,
+            }
+
+            async fn health() -> &'static str {
+                "ok"
+            }
+
+            async fn query(
+                State(state): State<Arc<ServeState>>,
+                Json(req): Json<QueryReq>,
+            ) -> Result<Json<Vec<QueryHit>>, (StatusCode, String)> {
+                if req.text.trim().is_empty() {
+                    return Err((StatusCode::BAD_REQUEST, "text must not be empty".into()));
+                }
+                let top_k = req.top_k.min(100); // cap to avoid pathological clients
+                let vec = state.embedder.embed(&req.text).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("embed: {:#}", e),
+                    )
+                })?;
+                let hits = state.store.query(&vec, top_k).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("query: {:#}", e),
+                    )
+                })?;
+                let mut out = Vec::with_capacity(hits.len());
+                for h in hits {
+                    let chunk = state.store.get_chunk(&h.chunk_id).map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("get_chunk: {:#}", e),
+                        )
+                    })?;
+                    if let Some(c) = chunk {
+                        out.push(QueryHit {
+                            chunk_id: h.chunk_id,
+                            score: h.score,
+                            path: c.path,
+                            offset: c.offset,
+                            text: c.text,
+                        });
+                    }
+                }
+                Ok(Json(out))
+            }
+
+            let state = Arc::new(ServeState { embedder, store });
+            let app = Router::new()
+                .route("/health", get(health))
+                .route("/query", post(query))
+                .with_state(state);
+
+            let addr = format!("{}:{}", host, port);
+            println!("ssd-llm serve-index listening on http://{} (Ctrl+C to stop)", addr);
+
+            // Build a tokio runtime inline — the rest of main() is sync.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind(&addr)
+                    .await
+                    .with_context(|| format!("bind {}", addr))?;
+                axum::serve(listener, app).await.context("serve")?;
+                anyhow::Ok(())
+            })?;
         }
 
         Commands::Query {
