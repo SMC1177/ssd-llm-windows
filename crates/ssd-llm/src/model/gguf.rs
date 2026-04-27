@@ -225,6 +225,8 @@ pub struct GgufFile {
     pub header: GgufHeader,
     pub metadata: HashMap<String, MetadataValue>,
     pub tensors: Vec<TensorInfo>,
+    /// O(1) name → index into `tensors`
+    tensor_index: HashMap<String, usize>,
     pub data_offset: u64, // absolute file offset where tensor data begins
     pub file_size: u64,
 }
@@ -305,10 +307,17 @@ impl GgufFile {
             .unwrap_or(32) as u64;
         let data_offset = current_pos.div_ceil(alignment) * alignment;
 
+        let tensor_index: HashMap<String, usize> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.name.clone(), i))
+            .collect();
+
         Ok(GgufFile {
             header,
             metadata,
             tensors,
+            tensor_index,
             data_offset,
             file_size,
         })
@@ -419,9 +428,9 @@ impl GgufFile {
         self.n_experts() > 0 && self.n_experts_used() > 0
     }
 
-    /// Find tensor by name
+    /// Find tensor by name — O(1) via pre-built index
     pub fn find_tensor(&self, name: &str) -> Option<&TensorInfo> {
-        self.tensors.iter().find(|t| t.name == name)
+        self.tensor_index.get(name).map(|&i| &self.tensors[i])
     }
 
     /// Get tensors for a specific layer

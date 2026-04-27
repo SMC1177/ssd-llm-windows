@@ -733,7 +733,9 @@ pub fn generate(
         }
     }
 
-    let prefetcher = Prefetcher::new(PrefetchStrategy::LookAhead(2));
+    // No prefetch during decode — model is in OS page cache after prefill.
+    // PrefetchVirtualMemory + VirtualUnlock on Windows cost ~7ms/layer = 196ms/token wasted.
+    let prefetcher = Prefetcher::new(PrefetchStrategy::None);
     let sampler = build_sampler(config);
 
     // Parse grammar if provided

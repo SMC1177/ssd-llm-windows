@@ -56,13 +56,14 @@ impl Prefetcher {
 
     /// Called after processing a layer — can evict old layers
     pub fn on_layer_done(&self, completed_layer: u32, streamer: &SsdStreamer, gguf: &GgufFile) {
-        // Evict layer that's 2 behind (keep 1 buffer for potential re-use)
-        if completed_layer >= 2 {
-            streamer.evict_layer(gguf, completed_layer - 2);
-            debug!(
-                "Prefetcher: evicted layer {} from OS cache",
-                completed_layer - 2
-            );
+        match &self.strategy {
+            PrefetchStrategy::None => {}
+            _ => {
+                if completed_layer >= 2 {
+                    streamer.evict_layer(gguf, completed_layer - 2);
+                    debug!("Prefetcher: evicted layer {} from OS cache", completed_layer - 2);
+                }
+            }
         }
     }
 }
