@@ -40,7 +40,7 @@ fn streaming_layer_forward(
     let mut attn_input = hidden_state.clone();
     if let Ok(norm_w) = streamer.load_named_tensor_f32(gguf, &layer_name("attn_norm.weight")) {
         if layer_idx == 0 {
-            info!("NORM WIRING: attn_norm[0..4]=[{:.6},{:.6},{:.6},{:.6}] len={}", norm_w[0], norm_w[1], norm_w[2], norm_w[3], norm_w.len());
+            debug!("NORM WIRING: attn_norm[0..4]=[{:.6},{:.6},{:.6},{:.6}] len={}", norm_w[0], norm_w[1], norm_w[2], norm_w[3], norm_w.len());
         }
         crate::metal::compute::rmsnorm_f32_fast(&mut attn_input, &norm_w, rms_eps);
     }
