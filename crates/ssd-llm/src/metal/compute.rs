@@ -752,6 +752,67 @@ fn matvec_q4_0_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
     y
 }
 
+/// AVX2 accelerated inner loop for Q4K sub-block dot product.
+/// Computes: scale * dot(nibbles, x) - min_val * sum(x)
+/// where nibbles are extracted from 32 packed bytes (low or high 4 bits each).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod avx2_q4k {
+    use std::arch::x86_64::*;
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum256(v: __m256) -> f32 {
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        let s = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(s);
+        let sums = _mm_add_ps(s, shuf);
+        let hi32 = _mm_movehl_ps(sums, sums);
+        _mm_cvtss_f32(_mm_add_ss(sums, hi32))
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn sub_block_dot(
+        qs_sb: *const u8,
+        x_sb: *const f32,
+        scale: f32,
+        min_val: f32,
+        half_high: bool,
+    ) -> f32 {
+        let raw = _mm256_loadu_si256(qs_sb as *const __m256i);
+        let mask = _mm256_set1_epi8(0x0Fu8 as i8);
+        let nibbles = if half_high {
+            _mm256_and_si256(_mm256_srli_epi16(raw, 4), mask)
+        } else {
+            _mm256_and_si256(raw, mask)
+        };
+
+        let lo128 = _mm256_castsi256_si128(nibbles);
+        let hi128 = _mm256_extracti128_si256(nibbles, 1);
+
+        // Zero-extend each group of 8 bytes → 8 x i32 → f32
+        let f0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo128));
+        let f1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(lo128, 8)));
+        let f2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi128));
+        let f3 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(hi128, 8)));
+
+        let x0 = _mm256_loadu_ps(x_sb);
+        let x1 = _mm256_loadu_ps(x_sb.add(8));
+        let x2 = _mm256_loadu_ps(x_sb.add(16));
+        let x3 = _mm256_loadu_ps(x_sb.add(24));
+
+        let mut dot = _mm256_mul_ps(f0, x0);
+        dot = _mm256_fmadd_ps(f1, x1, dot);
+        dot = _mm256_fmadd_ps(f2, x2, dot);
+        dot = _mm256_fmadd_ps(f3, x3, dot);
+
+        let mut xsum = _mm256_add_ps(x0, x1);
+        xsum = _mm256_add_ps(xsum, _mm256_add_ps(x2, x3));
+
+        scale * hsum256(dot) - min_val * hsum256(xsum)
+    }
+}
+
 /// CPU Q4_K dequant matvec
 fn matvec_q4_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     let block_size = 256usize;
@@ -770,13 +831,6 @@ fn matvec_q4_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
             let qs = &w[boff + 16..boff + 144];
             let x_base = b * block_size;
 
-            // Canonical Q4K: sub-block sb fills output position [sb*32 .. sb*32+32].
-            // Each sub-block reads 32 bytes from qs[(sb/2)*32 ..], using low nibbles
-            // when sb is even and high nibbles when sb is odd.
-            // Canonical llama.cpp get_scale_min_k4:
-            //   if j<4: d = sc[j] & 0x3F ; m = sc[j+4] & 0x3F
-            //   else:   d = (sc[j+4] & 0xF) | ((sc[j-4] >> 6) << 4)
-            //           m = (sc[j+4] >> 4) | ((sc[j]   >> 6) << 4)
             for sb in 0..8u8 {
                 let (sc_low, m_low) = if sb < 4 {
                     (sc[sb as usize] & 0x3F, sc[sb as usize + 4] & 0x3F)
@@ -789,16 +843,29 @@ fn matvec_q4_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
                 };
                 let scale = d * sc_low as f32;
                 let min_val = dmin * m_low as f32;
-
-                let byte_chunk = (sb / 2) as usize;
+                let qs_off = (sb / 2) as usize * 32;
                 let half_high = (sb % 2) == 1;
-                let qs_off = byte_chunk * 32;
                 let x_off = x_base + sb as usize * 32;
-                for l in 0..32usize {
-                    let byte_val = qs[qs_off + l];
-                    let nibble = if half_high { byte_val >> 4 } else { byte_val & 0x0F };
-                    let v = scale * nibble as f32 - min_val;
-                    sum += v * x[x_off + l];
+
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                {
+                    sum += unsafe {
+                        avx2_q4k::sub_block_dot(
+                            qs[qs_off..].as_ptr(),
+                            x[x_off..].as_ptr(),
+                            scale,
+                            min_val,
+                            half_high,
+                        )
+                    };
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+                {
+                    for l in 0..32usize {
+                        let byte_val = qs[qs_off + l];
+                        let nibble = if half_high { byte_val >> 4 } else { byte_val & 0x0F };
+                        sum += (scale * nibble as f32 - min_val) * x[x_off + l];
+                    }
                 }
             }
         }
