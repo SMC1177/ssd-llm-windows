@@ -10,6 +10,7 @@
 use crate::metal::compute::{matvec_f32_simd, matvec_quantized_cpu, silu_f32};
 use crate::metal::gpu::MetalGpu;
 use crate::model::gguf::GgmlType;
+use rayon::prelude::*;
 
 /// Minimum intermediate size to justify GPU dispatch overhead
 const MIN_GPU_FF_ELEMENTS: usize = 2048;
@@ -45,7 +46,7 @@ pub fn feed_forward(
 }
 
 /// Zero-copy quantized SwiGLU FFN: all projections run directly on raw mmap bytes.
-/// Peak memory: ~n_ff * 4 bytes (one intermediate vector) instead of 3 * n_ff * n_embd * 4.
+/// gate and up projections run in parallel (independent reads) to saturate dual-channel DDR4.
 pub fn feed_forward_quantized(
     x: &[f32],
     gate_raw: &[u8],
@@ -57,12 +58,15 @@ pub fn feed_forward_quantized(
     n_embd: usize,
     n_ff: usize,
 ) -> Vec<f32> {
-    // gate = silu(x @ W_gate)
-    let mut gate = matvec_quantized_cpu(gate_raw, x, n_ff, n_embd, gate_dtype);
-    silu_f32(&mut gate);
-
-    // up = x @ W_up
-    let up = matvec_quantized_cpu(up_raw, x, n_ff, n_embd, up_dtype);
+    // gate and up are independent — run concurrently to utilize both DDR4 channels
+    let (mut gate, up) = rayon::join(
+        || {
+            let mut g = matvec_quantized_cpu(gate_raw, x, n_ff, n_embd, gate_dtype);
+            silu_f32(&mut g);
+            g
+        },
+        || matvec_quantized_cpu(up_raw, x, n_ff, n_embd, up_dtype),
+    );
 
     // element-wise: gate * up
     for (g, u) in gate.iter_mut().zip(up.iter()) {

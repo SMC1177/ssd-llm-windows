@@ -824,6 +824,20 @@ fn matvec_q4_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
+            // Prefetch next block's weight bytes 2 blocks ahead (3 cache lines = 192B covers 144B block)
+            #[cfg(target_arch = "x86_64")]
+            {
+                const AHEAD: usize = 2;
+                if b + AHEAD < blocks_per_row {
+                    let poff = row_off + (b + AHEAD) * block_bytes;
+                    unsafe {
+                        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                        _mm_prefetch(w.as_ptr().add(poff) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(w.as_ptr().add(poff + 64) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(w.as_ptr().add(poff + 128) as *const i8, _MM_HINT_T0);
+                    }
+                }
+            }
             let boff = row_off + b * block_bytes;
             let d = f16_to_f32(w[boff], w[boff + 1]);
             let dmin = f16_to_f32(w[boff + 2], w[boff + 3]);
@@ -874,6 +888,36 @@ fn matvec_q4_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
     y
 }
 
+/// AVX2 dot product of two pre-scaled f32 arrays of exactly 256 elements.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod avx2_q6k {
+    use std::arch::x86_64::*;
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn hsum256(v: __m256) -> f32 {
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        let s = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(s);
+        let sums = _mm_add_ps(s, shuf);
+        let hi32 = _mm_movehl_ps(sums, sums);
+        _mm_cvtss_f32(_mm_add_ss(sums, hi32))
+    }
+
+    /// Dot product of two f32[256] arrays using FMA.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_256(a: *const f32, b: *const f32) -> f32 {
+        let mut acc = _mm256_setzero_ps();
+        for i in 0..32 {
+            let av = _mm256_loadu_ps(a.add(i * 8));
+            let bv = _mm256_loadu_ps(b.add(i * 8));
+            acc = _mm256_fmadd_ps(av, bv, acc);
+        }
+        hsum256(acc)
+    }
+}
+
 /// CPU Q6_K dequant matvec — stride-32 interleaved layout matching llama.cpp
 fn matvec_q6_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     let block_size = 256usize;
@@ -884,6 +928,8 @@ fn matvec_q6_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
     y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
+        let mut dequant_buf = [0.0f32; 256];
+
         for b in 0..blocks_per_row {
             let boff = row_off + b * block_bytes;
             let ql = &w[boff..boff + 128];
@@ -892,7 +938,7 @@ fn matvec_q6_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
             let d = f16_to_f32(w[boff + 208], w[boff + 209]);
             let x_base = b * block_size;
 
-            // Two halves of 128 elements each
+            // Scalar dequant: write pre-scaled values into dequant_buf
             let mut ql_off = 0usize;
             let mut qh_off = 0usize;
             let mut sc_off = 0usize;
@@ -911,15 +957,27 @@ fn matvec_q6_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
                     let s4 = d * scales[sc_off + is + 4] as i8 as f32;
                     let s6 = d * scales[sc_off + is + 6] as i8 as f32;
 
-                    sum += s0 * q1 as f32 * x[x_base + x_off + l];
-                    sum += s2 * q2 as f32 * x[x_base + x_off + l + 32];
-                    sum += s4 * q3 as f32 * x[x_base + x_off + l + 64];
-                    sum += s6 * q4 as f32 * x[x_base + x_off + l + 96];
+                    dequant_buf[x_off + l] = s0 * q1 as f32;
+                    dequant_buf[x_off + l + 32] = s2 * q2 as f32;
+                    dequant_buf[x_off + l + 64] = s4 * q3 as f32;
+                    dequant_buf[x_off + l + 96] = s6 * q4 as f32;
                 }
                 ql_off += 64;
                 qh_off += 32;
                 sc_off += 8;
                 x_off += 128;
+            }
+
+            // AVX2 dot product over the 256 pre-scaled values
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                sum += unsafe { avx2_q6k::dot_256(dequant_buf.as_ptr(), x[x_base..].as_ptr()) };
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            {
+                for i in 0..256 {
+                    sum += dequant_buf[i] * x[x_base + i];
+                }
             }
         }
         *y_val = sum;
@@ -2410,13 +2468,47 @@ pub(crate) fn matvec_f16_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize)
     let mut y = vec![0.0f32; out_dim];
     y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * in_dim * 2;
-        let mut sum = 0.0f32;
-        for (col, &xv) in x.iter().enumerate().take(in_dim) {
-            let off = row_off + col * 2;
-            let w_f32 = f16_to_f32(w[off], w[off + 1]);
-            sum += w_f32 * xv;
+
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "f16c"))]
+        {
+            use std::arch::x86_64::*;
+            let chunks = in_dim / 8;
+            unsafe {
+                let w_ptr = w.as_ptr().add(row_off) as *const i16;
+                let x_ptr = x.as_ptr();
+                let mut acc = _mm256_setzero_ps();
+                for i in 0..chunks {
+                    let w8 = _mm_loadu_si128(w_ptr.add(i * 8) as *const __m128i);
+                    let wf = _mm256_cvtph_ps(w8);
+                    let xv = _mm256_loadu_ps(x_ptr.add(i * 8));
+                    acc = _mm256_fmadd_ps(wf, xv, acc);
+                }
+                let lo = _mm256_castps256_ps128(acc);
+                let hi = _mm256_extractf128_ps(acc, 1);
+                let s = _mm_add_ps(lo, hi);
+                let shuf = _mm_movehdup_ps(s);
+                let sums = _mm_add_ps(s, shuf);
+                let hi32 = _mm_movehl_ps(sums, sums);
+                let mut sum = _mm_cvtss_f32(_mm_add_ss(sums, hi32));
+                for col in (chunks * 8)..in_dim {
+                    let off = col * 2;
+                    sum += f16_to_f32(w[row_off + off], w[row_off + off + 1]) * x[col];
+                }
+                *y_val = sum;
+            }
+            return;
         }
-        *y_val = sum;
+
+        #[allow(unreachable_code)]
+        {
+            let mut sum = 0.0f32;
+            for (col, &xv) in x.iter().enumerate().take(in_dim) {
+                let off = row_off + col * 2;
+                let w_f32 = f16_to_f32(w[off], w[off + 1]);
+                sum += w_f32 * xv;
+            }
+            *y_val = sum;
+        }
     });
     y
 }
