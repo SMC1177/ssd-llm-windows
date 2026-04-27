@@ -82,12 +82,9 @@ fn streaming_layer_forward(
         let q_dim = tq.dimensions.get(1).copied().unwrap_or(n_embd as u64) as usize;
         let kv_dim = tk.dimensions.get(1).copied().unwrap_or(n_embd as u64) as usize;
 
-        // DIAGNOSTIC: Test transpose hypothesis on attn_q (square, safe to transpose)
-        if layer_idx == 0 {
+        if layer_idx == 0 && tracing::enabled!(tracing::Level::DEBUG) {
             if let Ok(wq_f32) = streamer.load_tensor_f32(tq) {
-                // Normal: y = W @ x (W is [2048 rows, 2048 cols])
                 let y_normal = crate::metal::compute::matvec_f32_simd(&wq_f32, &attn_input, q_dim, n_embd);
-                // Transposed: y = W^T @ x (transpose the dequantized weight)
                 let mut wq_t = vec![0.0f32; q_dim * n_embd];
                 for r in 0..q_dim {
                     for c in 0..n_embd {
@@ -95,13 +92,13 @@ fn streaming_layer_forward(
                     }
                 }
                 let y_transposed = crate::metal::compute::matvec_f32_simd(&wq_t, &attn_input, q_dim, n_embd);
-                info!(
+                debug!(
                     "TRANSPOSE TEST attn_q layer 0: normal[0..4]=[{:.4},{:.4},{:.4},{:.4}] transposed[0..4]=[{:.4},{:.4},{:.4},{:.4}]",
                     y_normal[0], y_normal[1], y_normal[2], y_normal[3],
                     y_transposed[0], y_transposed[1], y_transposed[2], y_transposed[3],
                 );
                 let n_diff = y_normal.iter().zip(y_transposed.iter()).filter(|(a,b)| (*a - *b).abs() > 0.01).count();
-                info!("TRANSPOSE TEST: {} of {} elements differ by >0.01", n_diff, q_dim);
+                debug!("TRANSPOSE TEST: {} of {} elements differ by >0.01", n_diff, q_dim);
             }
         }
 
@@ -152,7 +149,7 @@ fn streaming_layer_forward(
     match streamer.load_named_tensor_f32(gguf, &layer_name("ffn_norm.weight")) {
         Ok(norm_w) => {
             if layer_idx == 0 {
-                info!("NORM WIRING: ffn_norm[0..4]=[{:.6},{:.6},{:.6},{:.6}] len={}", norm_w[0], norm_w[1], norm_w[2], norm_w[3], norm_w.len());
+                debug!("NORM WIRING: ffn_norm[0..4]=[{:.6},{:.6},{:.6},{:.6}] len={}", norm_w[0], norm_w[1], norm_w[2], norm_w[3], norm_w.len());
             }
             crate::metal::compute::rmsnorm_f32_fast(&mut ffn_input, &norm_w, rms_eps);
             if layer_idx <= 2 {
@@ -178,28 +175,9 @@ fn streaming_layer_forward(
 
         let n_ff = tg.dimensions[1] as usize; // output dim of gate projection
 
-        // AOT F32 BYPASS: If ffn_down is Q6K, dequantize to F32 and use trusted F32 matvec
-        // This isolates Q6K from the forward pass to determine if the bug is attention or Q6K
-        let ffn_output = if td.dtype == crate::model::gguf::GgmlType::Q6K {
-            // Gate and up projections (Q4K — trusted)
-            let mut gate_vec = crate::metal::compute::matvec_quantized_cpu(
-                gate_raw, &ffn_input, n_ff, n_embd, tg.dtype,
-            );
-            crate::metal::compute::silu_f32(&mut gate_vec);
-            let up_vec = crate::metal::compute::matvec_quantized_cpu(
-                up_raw, &ffn_input, n_ff, n_embd, tu.dtype,
-            );
-            for (g, u) in gate_vec.iter_mut().zip(up_vec.iter()) {
-                *g *= u;
-            }
-            // Down projection: bypass Q6K matvec, use dequantized F32
-            let down_f32 = streamer.load_tensor_f32(td)?;
-            crate::metal::compute::matvec_f32_simd(&down_f32, &gate_vec, n_embd, n_ff)
-        } else {
-            feed_forward_quantized(
-                &ffn_input, gate_raw, tg.dtype, up_raw, tu.dtype, down_raw, td.dtype, n_embd, n_ff,
-            )
-        };
+        let ffn_output = feed_forward_quantized(
+            &ffn_input, gate_raw, tg.dtype, up_raw, tu.dtype, down_raw, td.dtype, n_embd, n_ff,
+        );
 
         // Diagnostic: check FFN output magnitude
         if layer_idx <= 2 {

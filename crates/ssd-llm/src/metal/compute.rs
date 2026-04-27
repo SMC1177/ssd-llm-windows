@@ -9,6 +9,7 @@
 
 use crate::metal::gpu::MetalGpu;
 use crate::model::gguf::GgmlType;
+use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
 /// Threshold below which CPU is faster than GPU dispatch overhead
@@ -392,10 +393,10 @@ pub fn matvec_f32_simd_scalar(w: &[f32], x: &[f32], out_dim: usize, in_dim: usiz
     let chunks = in_dim / 4;
     let remainder = in_dim % 4;
 
-    for (i, y_val) in y.iter_mut().enumerate().take(out_dim) {
+    y.par_iter_mut().enumerate().for_each(|(i, y_val)| {
         let row_start = i * in_dim;
         if row_start + in_dim > w.len() {
-            continue;
+            return;
         }
         let row = &w[row_start..row_start + in_dim];
 
@@ -418,7 +419,7 @@ pub fn matvec_f32_simd_scalar(w: &[f32], x: &[f32], out_dim: usize, in_dim: usiz
         }
 
         *y_val = sum0 + sum1 + sum2 + sum3;
-    }
+    });
 
     y
 }
@@ -731,7 +732,7 @@ fn matvec_q4_0_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -747,7 +748,7 @@ fn matvec_q4_0_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -758,7 +759,7 @@ fn matvec_q4_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -802,11 +803,10 @@ fn matvec_q4_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
-/// CPU Q6_K dequant matvec
 /// CPU Q6_K dequant matvec — stride-32 interleaved layout matching llama.cpp
 fn matvec_q6_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     let block_size = 256usize;
@@ -814,7 +814,7 @@ fn matvec_q6_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -856,7 +856,7 @@ fn matvec_q6_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -869,7 +869,7 @@ fn matvec_q3_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -905,7 +905,7 @@ fn matvec_q3_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -918,7 +918,7 @@ fn matvec_q5_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -966,7 +966,7 @@ fn matvec_q5_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -977,7 +977,7 @@ fn matvec_q8_0_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -990,7 +990,7 @@ fn matvec_q8_0_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -1003,7 +1003,7 @@ fn matvec_q2_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -1031,7 +1031,7 @@ fn matvec_q2_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -1044,7 +1044,7 @@ fn matvec_q8_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -1058,7 +1058,7 @@ fn matvec_q8_k_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -1077,7 +1077,7 @@ fn matvec_iq4_nl_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -1093,7 +1093,7 @@ fn matvec_iq4_nl_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -1107,7 +1107,7 @@ fn matvec_iq4_xs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -1142,7 +1142,7 @@ fn matvec_iq4_xs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -2056,7 +2056,7 @@ fn matvec_iq3_xxs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -2099,7 +2099,7 @@ fn matvec_iq3_xxs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -2115,7 +2115,7 @@ fn matvec_iq3_s_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -2193,7 +2193,7 @@ fn matvec_iq3_s_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -2210,7 +2210,7 @@ fn matvec_iq2_xxs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -2247,7 +2247,7 @@ fn matvec_iq2_xxs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -2265,7 +2265,7 @@ fn matvec_iq2_xs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<
     let blocks_per_row = in_dim / block_size;
     let mut y = vec![0.0f32; out_dim];
 
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * blocks_per_row * block_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -2305,7 +2305,7 @@ fn matvec_iq2_xs_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<
             }
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -2325,7 +2325,7 @@ fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
 /// CPU BF16 matvec: each weight is 2 bytes (BF16), dequantize on the fly
 fn matvec_bf16_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; out_dim];
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * in_dim * 2;
         let mut sum = 0.0f32;
         for (col, &xv) in x.iter().enumerate().take(in_dim) {
@@ -2334,14 +2334,14 @@ fn matvec_bf16_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f3
             sum += w_f32 * xv;
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
 /// CPU F16 matvec: each weight is 2 bytes (IEEE 754 half), dequantize on the fly
 pub(crate) fn matvec_f16_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; out_dim];
-    for (row, y_val) in y.iter_mut().enumerate() {
+    y.par_iter_mut().enumerate().for_each(|(row, y_val)| {
         let row_off = row * in_dim * 2;
         let mut sum = 0.0f32;
         for (col, &xv) in x.iter().enumerate().take(in_dim) {
@@ -2350,7 +2350,7 @@ pub(crate) fn matvec_f16_cpu(w: &[u8], x: &[f32], out_dim: usize, in_dim: usize)
             sum += w_f32 * xv;
         }
         *y_val = sum;
-    }
+    });
     y
 }
 
@@ -3232,6 +3232,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn test_fused_qkv_gpu_matches_cpu() {
         let gpu = MetalGpu::new();
         if gpu.is_none() {
@@ -3305,6 +3306,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn test_fused_residual_rmsnorm_gpu_matches_cpu() {
         // If Metal GPU is available, verify GPU path matches CPU
         let gpu = MetalGpu::new();
@@ -3345,24 +3347,26 @@ mod tests {
 
         rope_f32_multi_head(&mut x, head_dim, n_heads, position, theta);
 
-        // Verify each head independently
+        // Verify each head independently using the gap layout (i, i+half_dim)
+        // matching GGML_ROPE_TYPE_NORM (LLaMA/Qwen standard)
+        let half_dim = head_dim / 2;
         for h in 0..n_heads {
             let base = h * head_dim;
-            for i in 0..head_dim / 2 {
+            for i in 0..half_dim {
                 let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
                 let angle = position as f32 * freq;
                 let (sin_val, cos_val) = angle.sin_cos();
-                let x0 = orig[base + i * 2];
-                let x1 = orig[base + i * 2 + 1];
+                let x0 = orig[base + i];
+                let x1 = orig[base + i + half_dim];
                 let expected0 = x0 * cos_val - x1 * sin_val;
                 let expected1 = x0 * sin_val + x1 * cos_val;
                 assert!(
-                    (x[base + i * 2] - expected0).abs() < 1e-5,
+                    (x[base + i] - expected0).abs() < 1e-5,
                     "head {h} pair {i}: got {} expected {}",
-                    x[base + i * 2],
+                    x[base + i],
                     expected0
                 );
-                assert!((x[base + i * 2 + 1] - expected1).abs() < 1e-5,);
+                assert!((x[base + i + half_dim] - expected1).abs() < 1e-5,);
             }
         }
     }
@@ -3405,6 +3409,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn test_fused_qkv_rope_gpu_matches_cpu() {
         let gpu = MetalGpu::new();
         if gpu.is_none() {
@@ -3599,6 +3604,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn test_fused_post_attn_norm_gpu_matches_cpu() {
         let gpu = match crate::metal::gpu::MetalGpu::new() {
             Some(g) => g,
@@ -3678,6 +3684,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn test_fused_rmsnorm_linear_gpu_matches_cpu() {
         let gpu = match crate::metal::gpu::MetalGpu::new() {
             Some(g) => g,
@@ -3708,5 +3715,78 @@ mod tests {
                 gpu_result[i]
             );
         }
+    }
+
+    #[test]
+    fn test_matvec_q6_k_cpu_matches_manual_dequant() {
+        // Build a synthetic Q6K block (1 row, 256 elements = 210 bytes)
+        // and verify matvec_q6_k_cpu matches manual dequant + dot product.
+        let block_bytes = 210usize;
+        let mut block = vec![0u8; block_bytes];
+
+        // d = 0.25 (f16)
+        let d_bits = half::f16::from_f32(0.25).to_bits();
+        block[208] = d_bits as u8;
+        block[209] = (d_bits >> 8) as u8;
+
+        // scales: set all 16 scale bytes to 2i8 = 2 (as unsigned byte)
+        for i in 0..16 {
+            block[192 + i] = 2u8; // interpreted as i8: +2
+        }
+
+        // ql: alternating 0xA5 to get varied nibbles
+        for i in 0..128 {
+            block[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+
+        // qh: varied pattern
+        for i in 0..64 {
+            block[128 + i] = (i as u8).wrapping_mul(13).wrapping_add(5);
+        }
+
+        // x: simple pattern
+        let x: Vec<f32> = (0..256).map(|i| (i as f32) * 0.01 - 1.28).collect();
+
+        // Reference: manually dequantize using the same stride-32 logic
+        let d = 0.25f32;
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let mut ref_values = vec![0.0f32; 256];
+        let mut ql_off = 0usize;
+        let mut qh_off = 0usize;
+        let mut sc_off = 0usize;
+        let mut out_off = 0usize;
+        for _ in 0..2u32 {
+            for l in 0..32usize {
+                let is = l / 16;
+                let q1 = ((ql[ql_off + l] & 0x0F) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[ql_off + l + 32] & 0x0F) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+                let s0 = d * scales[sc_off + is] as i8 as f32;
+                let s2 = d * scales[sc_off + is + 2] as i8 as f32;
+                let s4 = d * scales[sc_off + is + 4] as i8 as f32;
+                let s6 = d * scales[sc_off + is + 6] as i8 as f32;
+                ref_values[out_off + l] = s0 * q1 as f32;
+                ref_values[out_off + l + 32] = s2 * q2 as f32;
+                ref_values[out_off + l + 64] = s4 * q3 as f32;
+                ref_values[out_off + l + 96] = s6 * q4 as f32;
+            }
+            ql_off += 64;
+            qh_off += 32;
+            sc_off += 8;
+            out_off += 128;
+        }
+
+        let expected: f32 = ref_values.iter().zip(x.iter()).map(|(w, xv)| w * xv).sum();
+        let result = matvec_q6_k_cpu(&block, &x, 1, 256);
+
+        assert!(
+            (result[0] - expected).abs() < 1e-4,
+            "Q6K matvec mismatch: got {}, expected {}",
+            result[0],
+            expected
+        );
     }
 }
