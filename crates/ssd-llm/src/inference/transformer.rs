@@ -1135,6 +1135,10 @@ pub fn generate(
                             if let Ok(raw) = streamer.raw_tensor_data(tensor) {
                                 g.upload_q4k(&name, raw, out_dim, in_dim)
                             } else { false }
+                        } else if tensor.dtype == GgmlType::Q6K && in_dim % 256 == 0 {
+                            if let Ok(raw) = streamer.raw_tensor_data(tensor) {
+                                g.upload_q6k(&name, raw, out_dim, in_dim)
+                            } else { false }
                         } else {
                             if let Ok(data) = streamer.load_tensor_f32(tensor) {
                                 g.upload(&name, &data, out_dim, in_dim)
@@ -1303,12 +1307,19 @@ pub fn generate(
                 .load_named_tensor_f32(gguf, "output_norm.weight")
                 .ok();
 
-            if let (Some(nw), Some(ref g)) = (norm_w.as_ref(), cuda_gpu.as_ref()) {
-                if g.has_q4k("output.weight") {
-                    let mut normed = hidden_state.clone();
-                    rms_norm_eps(&mut normed, nw, rms_eps);
-                    g.sgemv_q4k("output.weight", &normed).unwrap_or_else(|| vec![0.0f32; vocab_size])
+            if let (Some(_nw), Some(ref g)) = (norm_w.as_ref(), cuda_gpu.as_ref()) {
+                if g.has_q4k("output.weight") && g.has_norm("output_norm.weight") {
+                    // GPU-resident: rms_norm(hidden_dev) → Q4K SGEMV → logits in 1 dtoh.
+                    // hidden_dev still populated from the GPU-resident forward pass.
+                    g.compute_resident_output_logits(n_embd, vocab_size, rms_eps)
+                        .unwrap_or_else(|| {
+                            // fallback: CPU norm + GPU SGEMV
+                            let mut normed = hidden_state.clone();
+                            rms_norm_eps(&mut normed, norm_w.as_ref().unwrap(), rms_eps);
+                            g.sgemv_q4k("output.weight", &normed).unwrap_or_else(|| vec![0.0f32; vocab_size])
+                        })
                 } else if g.has("output.weight") {
+                    let nw = norm_w.as_ref().unwrap();
                     let mut normed = hidden_state.clone();
                     rms_norm_eps(&mut normed, nw, rms_eps);
                     g.sgemv("output.weight", &normed).unwrap_or_else(|| vec![0.0f32; vocab_size])
@@ -1317,7 +1328,7 @@ pub fn generate(
                     if let Some(emb_tensor) = gguf.find_tensor("token_embd.weight") {
                         if let Ok(raw) = streamer.raw_tensor_data(emb_tensor) {
                             crate::metal::compute::fused_rmsnorm_linear_quantized_cpu_eps(
-                                &hidden_state, nw, raw, emb_tensor.dtype.clone(),
+                                &hidden_state, norm_w.as_ref().unwrap(), raw, emb_tensor.dtype.clone(),
                                 vocab_size, n_embd, rms_eps,
                             )
                         } else { vec![0.0f32; vocab_size] }

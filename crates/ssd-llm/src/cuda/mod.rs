@@ -147,6 +147,96 @@ extern "C" __global__ void sgemv_q4k_kernel(
 }
 "#;
 
+    // F32 SGEMV: y = W·x  (row-major W, all f32).
+    // Same 32-rows/block shared-mem design as Q4K.
+    // grid=(out_dim/32,1,1), block=(1024,1,1), shared=in_dim*4 bytes.
+    const SGEMV_F32_SRC: &str = r#"
+extern "C" __global__ void sgemv_f32_kernel(
+    float* __restrict__ y,
+    const float* __restrict__ w,
+    const float* __restrict__ x,
+    int in_dim
+) {
+    extern __shared__ float xs[];
+    int warp_id = (int)(threadIdx.x >> 5);
+    int lane    = (int)(threadIdx.x & 31);
+    int row     = (int)blockIdx.x * 32 + warp_id;
+    for (int i = (int)threadIdx.x; i < in_dim; i += 1024) xs[i] = x[i];
+    __syncthreads();
+    const float* w_row = w + (long long)row * in_dim;
+    float partial = 0.0f;
+    for (int i = lane; i < in_dim; i += 32) partial += w_row[i] * xs[i];
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 16);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 8);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 4);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 2);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 1);
+    if (lane == 0) y[row] = partial;
+}
+"#;
+
+    // Q6K fused-dequant SGEMV: y[out_dim] = W[Q6K, out×in] · x[in_dim]
+    // Q6K block layout (210B / 256 values):
+    //   [0..128]   ql: lower 4 bits of the 6-bit value
+    //   [128..192] qh: upper 2 bits, 4 per byte
+    //   [192..208] scales[16]: i8, one per 16 elements
+    //   [208..210] d: f16LE global scale
+    // grid=(out_dim/32,1,1), block=(1024,1,1), shared=in_dim*4 bytes.
+    const SGEMV_Q6K_SRC: &str = r#"
+__device__ __forceinline__ float f16_le_to_f32_q6k(const unsigned char* p) {
+    unsigned int h = (unsigned int)p[0] | ((unsigned int)p[1] << 8u);
+    unsigned int sign = (h & 0x8000u) << 16;
+    unsigned int exp  = (h >> 10) & 0x1Fu;
+    unsigned int mant = h & 0x3FFu;
+    unsigned int bits;
+    if      (exp == 0u)  bits = sign;
+    else if (exp == 31u) bits = sign | 0x7F800000u | (mant << 13);
+    else                 bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    float f; asm("mov.b32 %0, %1;" : "=f"(f) : "r"(bits)); return f;
+}
+extern "C" __global__ void sgemv_q6k_kernel(
+    float* __restrict__ y,
+    const unsigned char* __restrict__ w,
+    const float* __restrict__ x,
+    int in_dim
+) {
+    extern __shared__ float xs[];
+    int warp_id = (int)(threadIdx.x >> 5);
+    int lane    = (int)(threadIdx.x & 31);
+    int row     = (int)blockIdx.x * 32 + warp_id;
+    int bpr     = in_dim >> 8;
+    for (int i = (int)threadIdx.x; i < in_dim; i += 1024) xs[i] = x[i];
+    __syncthreads();
+    const unsigned char* row_w = w + (long long)row * bpr * 210;
+    float partial = 0.0f;
+    for (int b = 0; b < bpr; b++) {
+        const unsigned char* blk  = row_w + b * 210;
+        const unsigned char* ql   = blk + 0;
+        const unsigned char* qh   = blk + 128;
+        const signed char*   sc   = (const signed char*)(blk + 192);
+        float d = f16_le_to_f32_q6k(blk + 208);
+        for (int j = 0; j < 8; j++) {
+            int elem     = lane + j * 32;
+            int ql_idx   = (j >> 2) * 64 + (j & 1) * 32 + lane;
+            int qh_idx   = (j >> 2) * 32 + lane;
+            int qh_shift = (j & 3) * 2;
+            int sc_idx   = (j >> 2) * 8 + (j & 3) * 2 + (lane >> 4);
+            unsigned int lo4 = (j & 2) ? (ql[ql_idx] >> 4) : (ql[ql_idx] & 0xFu);
+            unsigned int hi2 = (qh[qh_idx] >> qh_shift) & 3u;
+            int val = (int)(lo4 | (hi2 << 4)) - 32;
+            float scale = d * (float)sc[sc_idx];
+            partial += scale * (float)val * xs[b * 256 + elem];
+        }
+    }
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 16);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 8);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 4);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 2);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 1);
+    if (lane == 0) y[row] = partial;
+}
+"#;
+
     // Fused attention kernel: one launch replaces qk_norm(Q+K) + rope(Q+K) + kv_append + attn_compute.
     // Saves 4 extra WDDM launches vs 5-separate-kernels (each ~50µs on Windows WDDM).
     //
@@ -316,6 +406,12 @@ extern "C" __global__ void attn_fused_kernel(
         sgemv_q4k_fn: Option<CudaFunction>,
         /// Q4K weight tensors on device (raw bytes). Key: tensor name. Value: (bytes, out_dim, in_dim).
         q4k_tensors: HashMap<String, (CudaSlice<u8>, usize, usize)>,
+        /// NVRTC f32 SGEMV kernel (replaces cuBLAS for f32 tensors).
+        sgemv_f32_fn: Option<CudaFunction>,
+        /// NVRTC Q6K fused-dequant SGEMV kernel.
+        sgemv_q6k_fn: Option<CudaFunction>,
+        /// Q6K weight tensors on device (raw bytes). Key: tensor name. Value: (bytes, out_dim, in_dim).
+        q6k_tensors: HashMap<String, (CudaSlice<u8>, usize, usize)>,
     }
 
     impl CudaGpu {
@@ -373,6 +469,28 @@ extern "C" __global__ void attn_fused_kernel(
                 tracing::warn!("CUDA: Q4K SGEMV kernel failed to compile");
             }
 
+            let sgemv_f32_fn = (|| -> Option<CudaFunction> {
+                let ptx = compile_ptx(SGEMV_F32_SRC).ok()?;
+                device.load_ptx(ptx, "sgemv_f32", &["sgemv_f32_kernel"]).ok()?;
+                device.get_func("sgemv_f32", "sgemv_f32_kernel")
+            })();
+            if sgemv_f32_fn.is_some() {
+                info!("CUDA: F32 SGEMV kernel compiled (cuBLAS fallback replaced)");
+            } else {
+                tracing::warn!("CUDA: F32 SGEMV kernel failed to compile");
+            }
+
+            let sgemv_q6k_fn = (|| -> Option<CudaFunction> {
+                let ptx = compile_ptx(SGEMV_Q6K_SRC).ok()?;
+                device.load_ptx(ptx, "sgemv_q6k", &["sgemv_q6k_kernel"]).ok()?;
+                device.get_func("sgemv_q6k", "sgemv_q6k_kernel")
+            })();
+            if sgemv_q6k_fn.is_some() {
+                info!("CUDA: Q6K SGEMV kernel compiled (on-device Q6K dequant enabled)");
+            } else {
+                tracing::warn!("CUDA: Q6K SGEMV kernel failed to compile");
+            }
+
             info!(
                 "CUDA GPU ready: device 0, VRAM budget {:.1} GB",
                 vram_budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -400,6 +518,9 @@ extern "C" __global__ void attn_fused_kernel(
                 hidden_dev: RefCell::new(None),
                 sgemv_q4k_fn,
                 q4k_tensors: HashMap::new(),
+                sgemv_f32_fn,
+                sgemv_q6k_fn,
+                q6k_tensors: HashMap::new(),
             })
         }
 
@@ -575,9 +696,32 @@ extern "C" __global__ void attn_fused_kernel(
             self.q4k_tensors.contains_key(name)
         }
 
-        /// True if the tensor is on GPU as either f32 or Q4K.
+        /// Upload a weight tensor as raw Q6K bytes (210 bytes per 256 values).
+        pub fn upload_q6k(&mut self, name: &str, data: &[u8], out_dim: usize, in_dim: usize) -> bool {
+            debug_assert!(in_dim % 256 == 0, "Q6K requires in_dim % 256 == 0");
+            let bytes = data.len();
+            if self.vram_used + bytes > self.vram_budget { return false; }
+            match self.device.htod_sync_copy(data) {
+                Ok(slice) => {
+                    self.vram_used += bytes;
+                    self.q6k_tensors.insert(name.to_string(), (slice, out_dim, in_dim));
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("GPU Q6K upload failed for {}: {}", name, e);
+                    false
+                }
+            }
+        }
+
+        /// True if the tensor was uploaded as Q6K bytes.
+        pub fn has_q6k(&self, name: &str) -> bool {
+            self.q6k_tensors.contains_key(name)
+        }
+
+        /// True if the tensor is on GPU as f32, Q4K, or Q6K.
         pub fn has_weight(&self, name: &str) -> bool {
-            self.tensors.contains_key(name) || self.q4k_tensors.contains_key(name)
+            self.tensors.contains_key(name) || self.q4k_tensors.contains_key(name) || self.q6k_tensors.contains_key(name)
         }
 
         /// SGEMV using Q4K weights. x is a CPU slice (htod on entry); returns CPU logits.
@@ -1146,8 +1290,12 @@ extern "C" __global__ void attn_fused_kernel(
                     let xb = self.x_bufs.borrow(); let xd = xb.get(&n_embd)?;
                     unsafe { fn_.clone().launch(cfg, (y, wq, xd, n_embd as i32)).ok()? };
                 } else {
-                    let tq = self.tensors.get(q_name)?;
-                    unsafe { self.blas.gemv(Self::gemv_cfg(n_embd, q_out), &tq.slice, self.x_bufs.borrow().get(&n_embd).unwrap(), self.y_bufs.borrow_mut().get_mut(&q_out).unwrap()).ok()? };
+                    let fn_ = self.sgemv_f32_fn.as_ref()?;
+                    let wq_slice = &self.tensors.get(q_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (q_out as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: n_embd as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&q_out)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&n_embd)?;
+                    unsafe { fn_.clone().launch(cfg, (y, wq_slice, xd, n_embd as i32)).ok()? };
                 }
                 // K SGEMV → k_bufs[kv_out]
                 if let Some((wk, _, _)) = self.q4k_tensors.get(k_name) {
@@ -1157,8 +1305,12 @@ extern "C" __global__ void attn_fused_kernel(
                     let xb = self.x_bufs.borrow(); let xd = xb.get(&n_embd)?;
                     unsafe { fn_.clone().launch(cfg, (y, wk, xd, n_embd as i32)).ok()? };
                 } else {
-                    let tk = self.tensors.get(k_name)?;
-                    unsafe { self.blas.gemv(Self::gemv_cfg(n_embd, kv_out), &tk.slice, self.x_bufs.borrow().get(&n_embd).unwrap(), self.k_bufs.borrow_mut().get_mut(&kv_out).unwrap()).ok()? };
+                    let fn_ = self.sgemv_f32_fn.as_ref()?;
+                    let wk_slice = &self.tensors.get(k_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (kv_out as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: n_embd as u32 * 4 };
+                    let mut kb = self.k_bufs.borrow_mut(); let y = kb.get_mut(&kv_out)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&n_embd)?;
+                    unsafe { fn_.clone().launch(cfg, (y, wk_slice, xd, n_embd as i32)).ok()? };
                 }
                 // V SGEMV → y_bufs[kv_out]
                 if let Some((wv, _, _)) = self.q4k_tensors.get(v_name) {
@@ -1168,8 +1320,12 @@ extern "C" __global__ void attn_fused_kernel(
                     let xb = self.x_bufs.borrow(); let xd = xb.get(&n_embd)?;
                     unsafe { fn_.clone().launch(cfg, (y, wv, xd, n_embd as i32)).ok()? };
                 } else {
-                    let tv = self.tensors.get(v_name)?;
-                    unsafe { self.blas.gemv(Self::gemv_cfg(n_embd, kv_out), &tv.slice, self.x_bufs.borrow().get(&n_embd).unwrap(), self.y_bufs.borrow_mut().get_mut(&kv_out).unwrap()).ok()? };
+                    let fn_ = self.sgemv_f32_fn.as_ref()?;
+                    let wv_slice = &self.tensors.get(v_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (kv_out as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: n_embd as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&kv_out)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&n_embd)?;
+                    unsafe { fn_.clone().launch(cfg, (y, wv_slice, xd, n_embd as i32)).ok()? };
                 }
                 // Single fused kernel
                 let eps_arg = if q_norm_name.is_some() { rms_eps } else { 0.0f32 };
@@ -1201,8 +1357,12 @@ extern "C" __global__ void attn_fused_kernel(
                     let xb = self.x_bufs.borrow(); let xd = xb.get(&wo_in_dim)?;
                     unsafe { fn_.clone().launch(cfg, (y, wwo, xd, wo_in_dim as i32)).ok()? };
                 } else {
-                    let two = self.tensors.get(wo_name)?;
-                    unsafe { self.blas.gemv(Self::gemv_cfg(wo_in_dim, wo_out_dim), &two.slice, self.x_bufs.borrow().get(&wo_in_dim).unwrap(), self.y_bufs.borrow_mut().get_mut(&wo_out_dim).unwrap()).ok()? };
+                    let fn_ = self.sgemv_f32_fn.as_ref()?;
+                    let wwo_slice = &self.tensors.get(wo_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (wo_out_dim as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: wo_in_dim as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&wo_out_dim)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&wo_in_dim)?;
+                    unsafe { fn_.clone().launch(cfg, (y, wwo_slice, xd, wo_in_dim as i32)).ok()? };
                 }
                 Some(())
             })().is_some()
@@ -1220,6 +1380,8 @@ extern "C" __global__ void attn_fused_kernel(
                 };
                 let out_dim = if let Some((_, od, _)) = self.q4k_tensors.get(down_name) {
                     *od
+                } else if let Some((_, od, _)) = self.q6k_tensors.get(down_name) {
+                    *od
                 } else {
                     self.tensors.get(down_name)?.out_dim
                 };
@@ -1235,8 +1397,12 @@ extern "C" __global__ void attn_fused_kernel(
                     let xb = self.x_bufs.borrow(); let xd = xb.get(&in_dim)?;
                     unsafe { fn_.clone().launch(cfg, (y, wg, xd, in_dim as i32)).ok()? };
                 } else {
-                    let tg = self.tensors.get(gate_name)?;
-                    unsafe { self.blas.gemv(Self::gemv_cfg(in_dim, n_ff), &tg.slice, self.x_bufs.borrow().get(&in_dim).unwrap(), self.y_bufs.borrow_mut().get_mut(&n_ff).unwrap()).ok()? };
+                    let fn_ = self.sgemv_f32_fn.as_ref()?;
+                    let wg_slice = &self.tensors.get(gate_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (n_ff as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: in_dim as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&n_ff)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&in_dim)?;
+                    unsafe { fn_.clone().launch(cfg, (y, wg_slice, xd, in_dim as i32)).ok()? };
                 }
                 // Up SGEMV → up_bufs[n_ff]
                 if let Some((wu, _, _)) = self.q4k_tensors.get(up_name) {
@@ -1246,8 +1412,12 @@ extern "C" __global__ void attn_fused_kernel(
                     let xb = self.x_bufs.borrow(); let xd = xb.get(&in_dim)?;
                     unsafe { fn_.clone().launch(cfg, (y, wu, xd, in_dim as i32)).ok()? };
                 } else {
-                    let tu = self.tensors.get(up_name)?;
-                    unsafe { self.blas.gemv(Self::gemv_cfg(in_dim, n_ff), &tu.slice, self.x_bufs.borrow().get(&in_dim).unwrap(), self.up_bufs.borrow_mut().get_mut(&n_ff).unwrap()).ok()? };
+                    let fn_ = self.sgemv_f32_fn.as_ref()?;
+                    let wu_slice = &self.tensors.get(up_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (n_ff as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: in_dim as u32 * 4 };
+                    let mut ub = self.up_bufs.borrow_mut(); let y = ub.get_mut(&n_ff)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&in_dim)?;
+                    unsafe { fn_.clone().launch(cfg, (y, wu_slice, xd, in_dim as i32)).ok()? };
                 }
                 // silu(gate) * up → x_bufs[n_ff]  (input for down SGEMV)
                 { let cfg_k = LaunchConfig::for_num_elems(n_ff as u32); let mut yb = self.y_bufs.borrow_mut(); let gate_dev = yb.get_mut(&n_ff).unwrap(); let ub = self.up_bufs.borrow(); let up_dev = ub.get(&n_ff).unwrap(); let mut xb = self.x_bufs.borrow_mut(); let out_dev = xb.get_mut(&n_ff).unwrap(); unsafe { silu_had.clone().launch(cfg_k, (gate_dev, up_dev, out_dev, n_ff as i32)).ok()? }; }
@@ -1258,13 +1428,46 @@ extern "C" __global__ void attn_fused_kernel(
                     let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&out_dim)?;
                     let xb = self.x_bufs.borrow(); let xd = xb.get(&n_ff)?;
                     unsafe { fn_.clone().launch(cfg, (y, wd, xd, n_ff as i32)).ok()? };
+                } else if let Some((wd, _, _)) = self.q6k_tensors.get(down_name) {
+                    let fn_ = self.sgemv_q6k_fn.as_ref()?;
+                    let cfg = LaunchConfig { grid_dim: (out_dim as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: n_ff as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&out_dim)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&n_ff)?;
+                    unsafe { fn_.clone().launch(cfg, (y, wd, xd, n_ff as i32)).ok()? };
                 } else {
-                    let td = self.tensors.get(down_name)?;
-                    unsafe { self.blas.gemv(Self::gemv_cfg(n_ff, out_dim), &td.slice, self.x_bufs.borrow().get(&n_ff).unwrap(), self.y_bufs.borrow_mut().get_mut(&out_dim).unwrap()).ok()? };
+                    let fn_ = self.sgemv_f32_fn.as_ref()?;
+                    let wd_slice = &self.tensors.get(down_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (out_dim as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: n_ff as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&out_dim)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&n_ff)?;
+                    unsafe { fn_.clone().launch(cfg, (y, wd_slice, xd, n_ff as i32)).ok()? };
                 }
                 let _ = n_embd;
                 Some(())
             })().is_some()
+        }
+
+        /// GPU-resident output: rms_norm(hidden_dev, output_norm.weight) → Q4K SGEMV(output.weight) → logits.
+        /// Avoids download_hidden→CPU norm→re-upload cycle (saves 2 PCIe syncs per token).
+        /// Requires hidden_dev populated (from successful GPU-resident forward pass), output_norm.weight
+        /// in norm_bufs, and output.weight in q4k_tensors.
+        pub fn compute_resident_output_logits(&self, n_embd: usize, vocab_size: usize, rms_eps: f32) -> Option<Vec<f32>> {
+            let fn_ = self.sgemv_q4k_fn.as_ref()?;
+            let _ = self.q4k_tensors.get("output.weight")?;
+            // rms_norm(hidden_dev → x_bufs[n_embd])
+            if !self.rms_norm_on_hidden("output_norm.weight", n_embd, rms_eps) { return None; }
+            // allocate y_bufs[vocab_size] and h_bufs[vocab_size]
+            if !self.ensure_bufs(n_embd, vocab_size) { return None; }
+            // Q4K SGEMV(output.weight, x_bufs[n_embd] → y_bufs[vocab_size])
+            {
+                let (w, _, _) = self.q4k_tensors.get("output.weight").unwrap();
+                let cfg = LaunchConfig { grid_dim: (vocab_size as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: n_embd as u32 * 4 };
+                let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&vocab_size)?;
+                let xb = self.x_bufs.borrow(); let xd = xb.get(&n_embd)?;
+                unsafe { fn_.clone().launch(cfg, (y, w, xd, n_embd as i32)).ok()? };
+            }
+            // download — syncs the stream
+            self.device.dtoh_sync_copy(self.y_bufs.borrow().get(&vocab_size)?).ok()
         }
 
         pub fn vram_used_mb(&self) -> f64 {
