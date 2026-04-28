@@ -438,6 +438,87 @@ pub fn multi_head_attention_quantized(
     result
 }
 
+/// Attention from pre-projected Q, K, V vectors (GPU-computed projections).
+/// Applies QK-norm, RoPE, KV cache, softmax, and weighted-V — returns pre-Wo context vec.
+/// Caller is responsible for the Wo projection.
+pub fn attention_from_qkv(
+    mut q: Vec<f32>,
+    mut k: Vec<f32>,
+    v: Vec<f32>,
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    position: usize,
+    kv_cache: &mut LayerKvCache,
+    theta_base: f32,
+    q_norm_weight: Option<&[f32]>,
+    k_norm_weight: Option<&[f32]>,
+    rms_eps: f32,
+) -> Vec<f32> {
+    let q_dim = q.len();
+    let kv_dim = k.len();
+    let kv_head_dim = if n_head_kv > 0 { kv_dim / n_head_kv } else { head_dim };
+
+    // QK-norm (same logic as in multi_head_attention_quantized)
+    if let Some(qnw) = q_norm_weight {
+        for h in 0..n_head {
+            let start = h * head_dim;
+            let end = (start + head_dim).min(q.len());
+            let slice = &mut q[start..end];
+            let sum_sq: f32 = slice.iter().map(|v| v * v).sum();
+            let inv_rms = 1.0 / (sum_sq / slice.len() as f32 + rms_eps).sqrt();
+            for (i, val) in slice.iter_mut().enumerate() {
+                *val *= inv_rms * qnw.get(i).copied().unwrap_or(1.0);
+            }
+        }
+    }
+    if let Some(knw) = k_norm_weight {
+        for h in 0..n_head_kv {
+            let start = h * kv_head_dim;
+            let end = (start + kv_head_dim).min(k.len());
+            let slice = &mut k[start..end];
+            let sum_sq: f32 = slice.iter().map(|v| v * v).sum();
+            let inv_rms = 1.0 / (sum_sq / slice.len() as f32 + rms_eps).sqrt();
+            for (i, val) in slice.iter_mut().enumerate() {
+                *val *= inv_rms * knw.get(i).copied().unwrap_or(1.0);
+            }
+        }
+    }
+
+    let rope_dim = head_dim.min(kv_head_dim);
+    crate::metal::compute::rope_f32_multi_head(&mut q, rope_dim, n_head, position, theta_base);
+    crate::metal::compute::rope_f32_multi_head(&mut k, rope_dim, n_head_kv, position, theta_base);
+
+    let actual_n_head_kv = if head_dim > 0 { kv_dim / head_dim } else { n_head_kv };
+    kv_cache.append(k, v);
+
+    let seq_len = kv_cache.seq_len();
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let kv_group_size = (n_head / actual_n_head_kv).max(1);
+    let mut attn_output = vec![0.0f32; q_dim];
+
+    for h in 0..n_head {
+        let kv_h = h / kv_group_size;
+        let q_offset = h * head_dim;
+        let q_head = &q[q_offset..q_offset + head_dim];
+        let mut scores = Vec::with_capacity(seq_len);
+        for pos in 0..seq_len {
+            let k_head = kv_cache.key_at(pos, kv_h);
+            let dot: f32 = q_head.iter().zip(k_head.iter()).map(|(a, b)| a * b).sum();
+            scores.push(dot * scale);
+        }
+        softmax_f32_fast(&mut scores);
+        let out_offset = h * head_dim;
+        for d in 0..head_dim {
+            let weighted: f32 = scores.iter().enumerate().take(seq_len)
+                .map(|(pos, &score)| score * kv_cache.value_at(pos, kv_h)[d])
+                .sum();
+            attn_output[out_offset + d] = weighted;
+        }
+    }
+    attn_output
+}
+
 /// Legacy single-token attention (no cache, kept for compatibility)
 pub fn multi_head_attention(
     x: &[f32],

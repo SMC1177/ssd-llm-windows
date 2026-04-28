@@ -209,6 +209,7 @@ impl BatchScheduler {
                 &token_embeddings,
                 0,
                 &prefetcher,
+                None,
             )?;
             req.position = req.prompt_tokens.len();
             req.state = RequestState::Decoding;

@@ -112,16 +112,30 @@ fn streaming_layer_forward(
                 let vn = layer_name("attn_v.weight");
                 let on = layer_name("attn_output.weight");
                 if g.has(&qn) && g.has(&kn) && g.has(&vn) && g.has(&on) {
-                    // sgemv_qkv uploads attn_input ONCE for Q, K, V (saves 2 PCIe round-trips)
+                    let q_norm_name = layer_name("attn_q_norm.weight");
+                    let k_norm_name = layer_name("attn_k_norm.weight");
+                    let qnn = if g.has_norm(&q_norm_name) { Some(q_norm_name.as_str()) } else { None };
+                    let knn = if g.has_norm(&k_norm_name) { Some(k_norm_name.as_str()) } else { None };
+
+                    if let Some(wo_out) = g.attn_fused(
+                        layer_idx as usize,
+                        &qn, &kn, &vn, &on,
+                        qnn, knn,
+                        &attn_input,
+                        n_head, n_head_kv, head_dim,
+                        position, rms_eps, theta_base,
+                    ) {
+                        break 'attn_gpu wo_out;
+                    }
+
+                    // Fallback to sgemv_qkv + CPU attention (attn_fused unavailable)
                     if let Some((q_vec, k_vec, v_vec)) = g.sgemv_qkv(&qn, &kn, &vn, &attn_input) {
-                        let head_dim = if n_head > 0 { q_dim / n_head } else { q_dim };
                         let ctx = attention_from_qkv(
                             q_vec, k_vec, v_vec,
                             n_head, n_head_kv, head_dim,
                             position, kv_cache, theta_base,
                             q_norm_w.as_deref(), k_norm_w.as_deref(), rms_eps,
                         );
-                        // Wo projection via GPU
                         if let Some(wo_out) = g.sgemv(&on, &ctx) {
                             break 'attn_gpu wo_out;
                         }
@@ -1045,7 +1059,7 @@ pub fn generate(
     // prefill and decode can use the GPU path (previously this ran after prefill).
     // 6 GB budget: all 28 FFN layers fit for Qwen3-1.7B (~144 MB/layer × 28 = ~4 GB).
     let cuda_gpu = {
-        let mut gpu = CudaGpu::new(6_979_321_856); // 6.5 GB
+        let mut gpu = CudaGpu::new(7_516_192_768); // 7.0 GB (extra ~500 MB for on-device KV cache)
         if let Some(ref mut g) = gpu {
             let ffn_suffixes = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
             let mut budget_full = false;
@@ -1105,6 +1119,25 @@ pub fn generate(
             if attn_layers_loaded > 0 {
                 info!("CUDA: attn weights for {}/{} layers, total {:.0} MB",
                     attn_layers_loaded, n_layers, g.vram_used_mb());
+            }
+
+            // Upload QK-norm weights (tiny: head_dim floats each, ~512 bytes/layer).
+            let qk_norm_suffixes = ["attn_q_norm.weight", "attn_k_norm.weight"];
+            let mut qk_norm_count = 0u32;
+            for layer_idx in 0..n_layers {
+                for &suffix in &qk_norm_suffixes {
+                    let name = format!("blk.{}.{}", layer_idx, suffix);
+                    if let Some(tensor) = gguf.find_tensor(&name) {
+                        if let Ok(data) = streamer.load_tensor_f32(tensor) {
+                            if g.upload_norm(&name, &data) {
+                                qk_norm_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if qk_norm_count > 0 {
+                info!("CUDA: {} QK-norm weights uploaded", qk_norm_count);
             }
         }
         gpu

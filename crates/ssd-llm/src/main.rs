@@ -8,6 +8,8 @@
 mod api;
 mod benchmark;
 mod config;
+#[cfg(target_os = "windows")]
+mod cuda;
 mod inference;
 mod metal;
 mod model;
