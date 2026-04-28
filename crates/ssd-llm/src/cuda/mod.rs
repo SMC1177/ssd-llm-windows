@@ -11,13 +11,13 @@
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
     use cudarc::cublas::{CudaBlas, Gemv, GemvConfig};
-    use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{sys, CudaDevice, CudaFunction, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig};
     use cudarc::nvrtc::compile_ptx;
     use tracing::info;
 
@@ -256,11 +256,12 @@ extern "C" __global__ void attn_fused_kernel(
     float* kv_k, float* kv_v,
     const float* q_dev, const float* k_dev, const float* v_dev,
     const float* q_norm_w, const float* k_norm_w,
-    int seq_pos,
+    const int* seq_pos_ptr,
     float rms_eps,
     float theta_base,
     int kv_group_size
 ) {
+    int seq_pos     = *seq_pos_ptr;
     int head_dim    = (int)blockDim.x;
     int n_head_kv   = (int)gridDim.x / kv_group_size;
     float scale     = rsqrtf((float)head_dim);
@@ -412,11 +413,21 @@ extern "C" __global__ void attn_fused_kernel(
         sgemv_q6k_fn: Option<CudaFunction>,
         /// Q6K weight tensors on device (raw bytes). Key: tensor name. Value: (bytes, out_dim, in_dim).
         q6k_tensors: HashMap<String, (CudaSlice<u8>, usize, usize)>,
+        /// Device-resident seq_pos (4 bytes) — avoids baking position into CUDA graph.
+        seq_pos_dev: RefCell<Option<CudaSlice<i32>>>,
+        /// Captured CUDA graph (source for re-instantiation on every decode step).
+        cuda_graph: RefCell<Option<*mut sys::CUgraph_st>>,
+        /// Instantiated CUDA graph for the decode forward pass (fresh each token, destroyed after launch).
+        cuda_graph_exec: RefCell<Option<*mut sys::CUgraphExec_st>>,
+        /// Dedicated stream for graph execution (separate from capture/compute stream).
+        graph_exec_stream: Cell<sys::CUstream>,
+        /// True while recording a CUDA stream-capture — suppresses seq_pos htod uploads.
+        capturing: Cell<bool>,
     }
 
     impl CudaGpu {
         pub fn new(vram_budget_bytes: usize) -> Option<Self> {
-            let device = CudaDevice::new(0).ok()?;
+            let device = CudaDevice::new_with_stream(0).ok()?;
             let blas = CudaBlas::new(device.clone()).ok()?;
 
             // Compile silu+hadamard kernel via NVRTC.
@@ -521,11 +532,272 @@ extern "C" __global__ void attn_fused_kernel(
                 sgemv_f32_fn,
                 sgemv_q6k_fn,
                 q6k_tensors: HashMap::new(),
+                seq_pos_dev: RefCell::new(None),
+                cuda_graph: RefCell::new(None),
+                cuda_graph_exec: RefCell::new(None),
+                graph_exec_stream: {
+                    // Dedicated non-blocking stream for graph execution (separate from
+                    // capture/compute stream — avoids WDDM stream-reuse issue on Pascal).
+                    // CU_STREAM_NON_BLOCKING = 1: no implicit sync with default stream.
+                    let mut s: sys::CUstream = std::ptr::null_mut();
+                    let ok = unsafe { sys::lib().cuStreamCreate(&mut s, 1).result().is_ok() };
+                    Cell::new(if ok { s } else { std::ptr::null_mut() })
+                },
+                capturing: Cell::new(false),
             })
         }
 
         pub fn vram_remaining(&self) -> usize {
             self.vram_budget.saturating_sub(self.vram_used)
+        }
+
+        pub fn kv_max_seq(&self) -> usize { self.kv_max_seq }
+
+        // ── CUDA Graph helpers ────────────────────────────────────────────────
+
+        fn ensure_seq_pos_dev(&self) -> bool {
+            let mut spd = self.seq_pos_dev.borrow_mut();
+            if spd.is_none() {
+                match self.device.alloc_zeros::<i32>(1) {
+                    Ok(buf) => { *spd = Some(buf); true }
+                    Err(_) => false,
+                }
+            } else { true }
+        }
+
+        pub fn upload_seq_pos(&self, pos: usize) -> bool {
+            let spd = self.seq_pos_dev.borrow();
+            let buf = match spd.as_ref() { Some(b) => b, None => return false };
+            let dst_ptr = *buf.device_ptr();
+            let exec_stream = self.graph_exec_stream.get();
+            if exec_stream.is_null() { return false; }
+            let val: i32 = pos as i32;
+            unsafe {
+                // Copy seq_pos on the GRAPH EXECUTION STREAM so it arrives before graph replay.
+                let r = sys::lib().cuMemcpyHtoDAsync_v2(
+                    dst_ptr,
+                    &val as *const i32 as *const std::ffi::c_void,
+                    std::mem::size_of::<i32>(),
+                    exec_stream,
+                ).result();
+                if r.is_err() { return false; }
+                sys::lib().cuStreamSynchronize(exec_stream).result().is_ok()
+            }
+        }
+
+        /// Pre-allocate the vocab_size output buffer before graph capture.
+        pub fn preallocate_for_decode(&self, n_embd: usize, vocab_size: usize) -> bool {
+            self.ensure_bufs(n_embd, vocab_size)
+        }
+
+        /// Begin CUDA stream capture. After this call, all async kernel launches
+        /// on the device stream are recorded into a graph rather than executed.
+        /// Returns false if the stream is already capturing or capture fails.
+        pub fn begin_capture(&self) -> bool {
+            if !self.ensure_seq_pos_dev() { return false; }
+            self.capturing.set(true);
+            let stream = *self.device.cu_stream();
+            let result = unsafe {
+                sys::lib().cuStreamBeginCapture_v2(
+                    stream,
+                    sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_RELAXED,
+                ).result()
+            };
+            match result {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("cuStreamBeginCapture_v2 failed: {:?} stream={:?}", e, stream);
+                    self.capturing.set(false);
+                    false
+                }
+            }
+        }
+
+        /// End stream capture, save the graph, and instantiate the exec.
+        /// The graph is kept for re-instantiation on every decode step (WDDM workaround).
+        pub fn end_capture_and_instantiate(&self) -> bool {
+            self.capturing.set(false);
+            let stream = *self.device.cu_stream();
+            let (graph, exec) = unsafe {
+                let mut graph: sys::CUgraph = std::ptr::null_mut();
+                if sys::lib().cuStreamEndCapture(stream, &mut graph).result().is_err() {
+                    return false;
+                }
+                let mut exec: sys::CUgraphExec = std::ptr::null_mut();
+                let inst_ok = sys::lib().cuGraphInstantiateWithFlags(&mut exec, graph, 0).result().is_ok();
+                if !inst_ok {
+                    sys::lib().cuGraphDestroy(graph).result().ok();
+                    return false;
+                }
+                (graph, exec)
+            };
+            if let Some(old) = self.cuda_graph.borrow_mut().replace(graph) {
+                unsafe { sys::lib().cuGraphDestroy(old).result().ok(); }
+            }
+            if let Some(old) = self.cuda_graph_exec.borrow_mut().replace(exec) {
+                unsafe { sys::lib().cuGraphExecDestroy(old).result().ok(); }
+            }
+            true
+        }
+
+        pub fn has_graph(&self) -> bool {
+            self.cuda_graph.borrow().is_some()
+        }
+
+        /// Test whether CUDA Graphs can be replayed multiple times on this system.
+        /// Captures a single add_inplace_kernel on 1 element, replays 3 times.
+        pub fn test_graph_replay(&self) -> bool {
+            let fn_ = match &self.add_fn { Some(f) => f.clone(), None => return false };
+            let stream = *self.device.cu_stream();
+            let exec_stream = self.graph_exec_stream.get();
+            if exec_stream.is_null() { return false; }
+            // Allocate a 1-element buffer for the test
+            let mut x_buf = match self.device.alloc_zeros::<f32>(1) { Ok(b) => b, Err(_) => return false };
+            let y_buf = match self.device.alloc_zeros::<f32>(1) { Ok(b) => b, Err(_) => return false };
+            // Capture a trivial graph
+            let ok = unsafe { sys::lib().cuStreamBeginCapture_v2(stream, sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_RELAXED).result().is_ok() };
+            if !ok { return false; }
+            let cfg = LaunchConfig { grid_dim: (1,1,1), block_dim: (1,1,1), shared_mem_bytes: 0 };
+            unsafe { fn_.clone().launch(cfg, (&mut x_buf, &y_buf, 1i32)).ok() };
+            let (test_graph, test_exec) = unsafe {
+                let mut g: sys::CUgraph = std::ptr::null_mut();
+                if sys::lib().cuStreamEndCapture(stream, &mut g).result().is_err() { return false; }
+                let mut e: sys::CUgraphExec = std::ptr::null_mut();
+                let ok = sys::lib().cuGraphInstantiateWithFlags(&mut e, g, 0).result().is_ok();
+                if !ok { sys::lib().cuGraphDestroy(g).result().ok(); return false; }
+                (g, e)
+            };
+            // Attempt 3 replays
+            let mut success_count = 0u32;
+            let mut cur_exec = test_exec;
+            for i in 0..3 {
+                let r = unsafe { sys::lib().cuGraphLaunch(cur_exec, exec_stream).result() };
+                let s = unsafe { sys::lib().cuStreamSynchronize(exec_stream).result() };
+                if r.is_ok() && s.is_ok() {
+                    success_count += 1;
+                } else {
+                    tracing::warn!("trivial graph replay {} failed: launch={:?} sync={:?}", i, r, s);
+                }
+                // Re-instantiate for next try
+                unsafe { sys::lib().cuGraphExecDestroy(cur_exec).result().ok(); }
+                let mut new_e: sys::CUgraphExec = std::ptr::null_mut();
+                let inst_ok = unsafe { sys::lib().cuGraphInstantiateWithFlags(&mut new_e, test_graph, 0).result().is_ok() };
+                if !inst_ok { break; }
+                cur_exec = new_e;
+            }
+            unsafe {
+                sys::lib().cuGraphExecDestroy(cur_exec).result().ok();
+                sys::lib().cuGraphDestroy(test_graph).result().ok();
+            }
+            tracing::info!("trivial graph replay test: {}/3 succeeded", success_count);
+            success_count == 3
+        }
+
+        /// Launch the captured graph and synchronize.
+        ///
+        /// WDDM Pascal one-shot limitation: on this platform, a CUgraphExec becomes
+        /// invalid after its first cuStreamSynchronize. Reinstantiation from the same
+        /// CUgraph also fails (produces a non-launchable exec). Having two live execs
+        /// simultaneously causes CUDA_ERROR_ILLEGAL_ADDRESS.
+        ///
+        /// The only working pattern: per-token fresh capture in transformer.rs, then
+        /// one upload+launch+sync here, then destroy both exec and graph.
+        pub fn replay_graph_and_sync(&self) -> bool {
+            let t0 = std::time::Instant::now();
+            let exec = match *self.cuda_graph_exec.borrow() {
+                Some(e) => e,
+                None => { tracing::warn!("replay: no graph exec"); return false; }
+            };
+            let launch_stream = self.graph_exec_stream.get();
+            if launch_stream.is_null() {
+                tracing::warn!("replay: graph_exec_stream is null");
+                return false;
+            }
+            let t_setup = t0.elapsed();
+            let ok = unsafe {
+                let upload_r = sys::lib().cuGraphUpload(exec, launch_stream).result();
+                if upload_r.is_err() {
+                    tracing::warn!("cuGraphUpload failed: {:?}", upload_r);
+                    return false;
+                }
+                sys::lib().cuStreamSynchronize(launch_stream).result().ok();
+                let launch_r = sys::lib().cuGraphLaunch(exec, launch_stream).result();
+                if launch_r.is_err() {
+                    tracing::warn!("cuGraphLaunch failed: {:?}", launch_r);
+                    return false;
+                }
+                let sync_r = sys::lib().cuStreamSynchronize(launch_stream).result();
+                if sync_r.is_err() {
+                    tracing::warn!("cuStreamSynchronize after graph failed: {:?}", sync_r);
+                    return false;
+                }
+                true
+            };
+            if ok {
+                // Exec is one-shot on WDDM Pascal. Destroy exec and graph so the caller
+                // captures a fresh graph next token with no live execs overlapping.
+                unsafe { sys::lib().cuGraphExecDestroy(exec).result().ok(); }
+                *self.cuda_graph_exec.borrow_mut() = None;
+                if let Some(g) = self.cuda_graph.borrow_mut().take() {
+                    unsafe { sys::lib().cuGraphDestroy(g).result().ok(); }
+                }
+            }
+            let total = t0.elapsed();
+            tracing::info!("graph replay: setup={:.2}ms run={:.2}ms total={:.2}ms",
+                t_setup.as_secs_f64()*1000.0,
+                (total - t_setup).as_secs_f64()*1000.0,
+                total.as_secs_f64()*1000.0);
+            ok
+        }
+
+        pub fn save_kv_seq_lens(&self) -> HashMap<usize, usize> {
+            self.kv_seq_lens.borrow().clone()
+        }
+
+        pub fn restore_kv_seq_lens(&self, lens: HashMap<usize, usize>) {
+            *self.kv_seq_lens.borrow_mut() = lens;
+        }
+
+        pub fn advance_kv_seq_lens(&self) {
+            for v in self.kv_seq_lens.borrow_mut().values_mut() { *v += 1; }
+        }
+
+        /// Like compute_resident_output_logits but without the final dtoh sync.
+        /// For use inside CUDA graph capture (dtoh cannot be part of graph).
+        pub fn compute_resident_logits_no_sync(&self, n_embd: usize, vocab_size: usize, rms_eps: f32) -> bool {
+            (|| -> Option<()> {
+                let fn_ = self.sgemv_q4k_fn.as_ref()?;
+                let _ = self.q4k_tensors.get("output.weight")?;
+                if !self.rms_norm_on_hidden("output_norm.weight", n_embd, rms_eps) { return None; }
+                if !self.ensure_bufs(n_embd, vocab_size) { return None; }
+                let cfg = LaunchConfig { grid_dim: (vocab_size as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: n_embd as u32 * 4 };
+                let (w, _, _) = self.q4k_tensors.get("output.weight").unwrap();
+                let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&vocab_size)?;
+                let xb = self.x_bufs.borrow(); let xd = xb.get(&n_embd)?;
+                unsafe { fn_.clone().launch(cfg, (y, w, xd, n_embd as i32)).ok()? };
+                Some(())
+            })().is_some()
+        }
+
+        /// Download y_bufs[vocab_size] to CPU (call after replay_graph_and_sync).
+        pub fn download_logits(&self, vocab_size: usize) -> Option<Vec<f32>> {
+            let yb = self.y_bufs.borrow();
+            let buf = yb.get(&vocab_size)?;
+            let src_ptr = *buf.device_ptr();
+            let exec_stream = self.graph_exec_stream.get();
+            if exec_stream.is_null() { return None; }
+            let mut out = vec![0.0f32; vocab_size];
+            unsafe {
+                let r = sys::lib().cuMemcpyDtoHAsync_v2(
+                    out.as_mut_ptr() as *mut std::ffi::c_void,
+                    src_ptr,
+                    vocab_size * std::mem::size_of::<f32>(),
+                    exec_stream,
+                ).result();
+                if r.is_err() { return None; }
+                sys::lib().cuStreamSynchronize(exec_stream).result().ok()?;
+            }
+            Some(out)
         }
 
         pub fn upload(
@@ -1085,10 +1357,19 @@ extern "C" __global__ void attn_fused_kernel(
             if !self.ensure_bufs(n_embd, kv_out)        { return None; }
             if !self.ensure_bufs(wo_in_dim, wo_out_dim) { return None; }
             if !self.ensure_kv_cache(layer_idx, n_head_kv, head_dim) { return None; }
+            if !self.ensure_seq_pos_dev() { return None; }
 
             let seq_pos = *self.kv_seq_lens.borrow().get(&layer_idx).unwrap_or(&0);
             if seq_pos >= self.kv_max_seq { return None; }
             let new_seq_len = seq_pos + 1;
+
+            // Upload seq_pos to device for kernel
+            {
+                let mut spd = self.seq_pos_dev.borrow_mut();
+                if let Some(ref mut buf) = *spd {
+                    self.device.htod_sync_copy_into(&[seq_pos as i32], buf).ok()?;
+                }
+            }
 
             // 1. htod: x → x_bufs[n_embd]
             self.device.htod_sync_copy_into(
@@ -1129,7 +1410,6 @@ extern "C" __global__ void attn_fused_kernel(
             //    1 kernel launch × 50µs WDDM vs old 5 separate launches.
             //    Shared layout: [q_store: head_dim] [scratch: head_dim] [scores: new_seq_len]
             let do_qk_norm = if q_norm_name.is_some() { 1i32 } else { 0i32 };
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
             let shared_bytes = (2 * head_dim + new_seq_len) as u32 * 4;
             let cfg = LaunchConfig {
                 grid_dim: (n_head as u32, 1, 1),
@@ -1152,12 +1432,14 @@ extern "C" __global__ void attn_fused_kernel(
                 let eps_arg = if do_qk_norm != 0 { rms_eps } else { 0.0f32 };
                 let q_norm_w = q_norm_name.and_then(|n| self.norm_bufs.get(n)).unwrap_or(q_dev);
                 let k_norm_w = k_norm_name.and_then(|n| self.norm_bufs.get(n)).unwrap_or(k_dev);
+                let spd = self.seq_pos_dev.borrow();
+                let seq_pos_ptr = spd.as_ref()?;
                 unsafe {
                     fused_fn.clone().launch(cfg, (
                         ctx_out, kk, kv_v,
                         q_dev, k_dev, v_dev,
                         q_norm_w, k_norm_w,
-                        seq_pos as i32,
+                        seq_pos_ptr,
                         eps_arg, theta_base,
                         kv_group_size,
                     )).ok()?
@@ -1205,13 +1487,22 @@ extern "C" __global__ void attn_fused_kernel(
             }
         }
 
-        /// Upload hidden state to device (1 htod for the entire forward pass).
+        /// Upload hidden state to device on the graph execution stream.
         pub fn upload_hidden(&self, data: &[f32]) -> bool {
-            let mut hd = self.hidden_dev.borrow_mut();
-            if let Some(ref mut buf) = *hd {
-                self.device.htod_sync_copy_into(data, buf).is_ok()
-            } else {
-                false
+            let hd = self.hidden_dev.borrow();
+            let buf = match hd.as_ref() { Some(b) => b, None => return false };
+            let dst_ptr = *buf.device_ptr();
+            let exec_stream = self.graph_exec_stream.get();
+            if exec_stream.is_null() { return false; }
+            unsafe {
+                let r = sys::lib().cuMemcpyHtoDAsync_v2(
+                    dst_ptr,
+                    data.as_ptr() as *const std::ffi::c_void,
+                    data.len() * std::mem::size_of::<f32>(),
+                    exec_stream,
+                ).result();
+                if r.is_err() { return false; }
+                sys::lib().cuStreamSynchronize(exec_stream).result().is_ok()
             }
         }
 
@@ -1280,8 +1571,17 @@ extern "C" __global__ void attn_fused_kernel(
                 if !self.ensure_bufs(n_embd, kv_out) { return None; }
                 if !self.ensure_bufs(wo_in_dim, wo_out_dim) { return None; }
                 if !self.ensure_kv_cache(layer_idx, n_head_kv, head_dim) { return None; }
+                if !self.ensure_seq_pos_dev() { return None; }
                 let seq_pos = *self.kv_seq_lens.borrow().get(&layer_idx).unwrap_or(&0);
-                if seq_pos >= self.kv_max_seq { return None; }
+                if !self.capturing.get() && seq_pos >= self.kv_max_seq { return None; }
+                // Non-capture path: upload current seq_pos so kernel reads the right value.
+                // Capture path: skip htod (seq_pos_dev will be set externally before replay).
+                if !self.capturing.get() {
+                    let mut spd = self.seq_pos_dev.borrow_mut();
+                    if let Some(ref mut buf) = *spd {
+                        self.device.htod_sync_copy_into(&[seq_pos as i32], buf).ok()?;
+                    }
+                }
                 // Q SGEMV (x already on device) → y_bufs[q_out]
                 if let Some((wq, _, _)) = self.q4k_tensors.get(q_name) {
                     let fn_ = self.sgemv_q4k_fn.as_ref()?;
@@ -1330,7 +1630,12 @@ extern "C" __global__ void attn_fused_kernel(
                 // Single fused kernel
                 let eps_arg = if q_norm_name.is_some() { rms_eps } else { 0.0f32 };
                 let new_seq_len = seq_pos + 1;
-                let shared_bytes = (2 * head_dim + new_seq_len) as u32 * 4;
+                // During capture: use max shared_mem so the graph works at any seq_pos.
+                let shared_bytes = if self.capturing.get() {
+                    (2 * head_dim + self.kv_max_seq) as u32 * 4
+                } else {
+                    (2 * head_dim + new_seq_len) as u32 * 4
+                };
                 let cfg = LaunchConfig { grid_dim: (n_head as u32, 1, 1), block_dim: (head_dim as u32, 1, 1), shared_mem_bytes: shared_bytes };
                 {
                     let mut xb = self.x_bufs.borrow_mut();
@@ -1346,7 +1651,9 @@ extern "C" __global__ void attn_fused_kernel(
                     let k_dev = kb.get(&kv_out).unwrap();
                     let q_norm_w = q_norm_name.and_then(|n| self.norm_bufs.get(n)).unwrap_or(q_dev);
                     let k_norm_w = k_norm_name.and_then(|n| self.norm_bufs.get(n)).unwrap_or(k_dev);
-                    unsafe { fused_fn.clone().launch(cfg, (ctx_out, kk, kv_v, q_dev, k_dev, v_dev, q_norm_w, k_norm_w, seq_pos as i32, eps_arg, theta_base, kv_group_size)).ok()? };
+                    let spd = self.seq_pos_dev.borrow();
+                    let seq_pos_ptr = spd.as_ref()?;
+                    unsafe { fused_fn.clone().launch(cfg, (ctx_out, kk, kv_v, q_dev, k_dev, v_dev, q_norm_w, k_norm_w, seq_pos_ptr, eps_arg, theta_base, kv_group_size)).ok()? };
                 }
                 *self.kv_seq_lens.borrow_mut().entry(layer_idx).or_insert(0) = new_seq_len;
                 // Wo SGEMV → y_bufs[wo_out_dim] (no dtoh; caller reads via add_hidden_from_y)
@@ -1488,6 +1795,21 @@ extern "C" __global__ void attn_fused_kernel(
             }
         }
     }
+
+    impl Drop for CudaGpu {
+        fn drop(&mut self) {
+            if let Some(exec) = self.cuda_graph_exec.borrow_mut().take() {
+                unsafe { sys::lib().cuGraphExecDestroy(exec).result().ok(); }
+            }
+            if let Some(graph) = self.cuda_graph.borrow_mut().take() {
+                unsafe { sys::lib().cuGraphDestroy(graph).result().ok(); }
+            }
+            let s = self.graph_exec_stream.get();
+            if !s.is_null() {
+                unsafe { sys::lib().cuStreamDestroy_v2(s).result().ok(); }
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1502,12 +1824,15 @@ pub struct CudaGpu;
 impl CudaGpu {
     pub fn new(_vram_budget_bytes: usize) -> Option<Self> { None }
     pub fn vram_remaining(&self) -> usize { 0 }
+    pub fn kv_max_seq(&self) -> usize { 512 }
     pub fn upload(&mut self, _: &str, _: &[f32], _: usize, _: usize) -> bool { false }
     pub fn upload_norm(&mut self, _: &str, _: &[f32]) -> bool { false }
     pub fn upload_q4k(&mut self, _: &str, _: &[u8], _: usize, _: usize) -> bool { false }
+    pub fn upload_q6k(&mut self, _: &str, _: &[u8], _: usize, _: usize) -> bool { false }
     pub fn has(&self, _: &str) -> bool { false }
     pub fn has_norm(&self, _: &str) -> bool { false }
     pub fn has_q4k(&self, _: &str) -> bool { false }
+    pub fn has_q6k(&self, _: &str) -> bool { false }
     pub fn has_weight(&self, _: &str) -> bool { false }
     pub fn sgemv(&self, _: &str, _: &[f32]) -> Option<Vec<f32>> { None }
     pub fn sgemv_q4k(&self, _: &str, _: &[f32]) -> Option<Vec<f32>> { None }
@@ -1526,4 +1851,17 @@ impl CudaGpu {
     pub fn attn_fused_resident(&self, _: usize, _: &str, _: &str, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: usize, _: usize, _: usize, _: usize, _: usize, _: f32, _: f32) -> bool { false }
     pub fn ffn_fused_resident(&self, _: &str, _: &str, _: &str, _: usize) -> bool { false }
     pub fn vram_used_mb(&self) -> f64 { 0.0 }
+    pub fn upload_seq_pos(&self, _: usize) -> bool { false }
+    pub fn preallocate_for_decode(&self, _: usize, _: usize) -> bool { false }
+    pub fn begin_capture(&self) -> bool { false }
+    pub fn end_capture_and_instantiate(&self) -> bool { false }
+    pub fn has_graph(&self) -> bool { false }
+    pub fn test_graph_replay(&self) -> bool { false }
+    pub fn replay_graph_and_sync(&self) -> bool { false }
+    pub fn save_kv_seq_lens(&self) -> std::collections::HashMap<usize, usize> { std::collections::HashMap::new() }
+    pub fn restore_kv_seq_lens(&self, _: std::collections::HashMap<usize, usize>) {}
+    pub fn advance_kv_seq_lens(&self) {}
+    pub fn compute_resident_logits_no_sync(&self, _: usize, _: usize, _: f32) -> bool { false }
+    pub fn compute_resident_output_logits(&self, _: usize, _: usize, _: f32) -> Option<Vec<f32>> { None }
+    pub fn download_logits(&self, _: usize) -> Option<Vec<f32>> { None }
 }

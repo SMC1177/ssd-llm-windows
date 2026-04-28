@@ -1290,19 +1290,101 @@ pub fn generate(
         prompt_len as f64 / prefill_time.as_secs_f64()
     );
 
+    // Attempt CUDA graph capture for decode acceleration.
+    let theta_base_for_graph = gguf.rope_theta();
+    // Build a closure that captures (records) the 28-layer decode graph.
+    // Called once before the loop for the first token, and again per-token
+    // to test whether a fresh CUgraph succeeds where reinstantiation fails.
+    let capture_graph = |g: &crate::cuda::CudaGpu| -> bool {
+        let kv_saved = g.save_kv_seq_lens();
+        let t0 = std::time::Instant::now();
+        let ok = if g.begin_capture() {
+            let mut cap_ok = true;
+            for li in 0..n_layers as usize {
+                let attn_norm = format!("blk.{}.attn_norm.weight", li);
+                let ffn_norm  = format!("blk.{}.ffn_norm.weight", li);
+                let qn  = format!("blk.{}.attn_q.weight", li);
+                let kn  = format!("blk.{}.attn_k.weight", li);
+                let vn  = format!("blk.{}.attn_v.weight", li);
+                let on  = format!("blk.{}.attn_output.weight", li);
+                let gn  = format!("blk.{}.ffn_gate.weight", li);
+                let un  = format!("blk.{}.ffn_up.weight", li);
+                let dn  = format!("blk.{}.ffn_down.weight", li);
+                let qnn_s = format!("blk.{}.attn_q_norm.weight", li);
+                let knn_s = format!("blk.{}.attn_k_norm.weight", li);
+                let qnn = if g.has_norm(&qnn_s) { Some(qnn_s.as_str()) } else { None };
+                let knn = if g.has_norm(&knn_s) { Some(knn_s.as_str()) } else { None };
+                if !g.rms_norm_on_hidden(&attn_norm, n_embd, rms_eps)
+                    || !g.attn_fused_resident(li, &qn, &kn, &vn, &on, qnn, knn,
+                           n_embd, n_head, n_head_kv, head_dim, 0, rms_eps, theta_base_for_graph)
+                {
+                    cap_ok = false; break;
+                }
+                g.add_hidden_from_y(n_embd);
+                if !g.rms_norm_on_hidden(&ffn_norm, n_embd, rms_eps)
+                    || !g.ffn_fused_resident(&gn, &un, &dn, n_embd)
+                {
+                    cap_ok = false; break;
+                }
+                g.add_hidden_from_y(n_embd);
+            }
+            let inst_ok = g.end_capture_and_instantiate();
+            inst_ok && cap_ok
+        } else { false };
+        g.restore_kv_seq_lens(kv_saved);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        info!("CUDA graph capture+instantiate: {:.1}ms ok={}", ms, ok);
+        ok
+    };
+
+    let cuda_graph_capable = if let Some(ref g) = cuda_gpu {
+        let graphs_ok = g.test_graph_replay();
+        if !graphs_ok { info!("CUDA graph replay not supported on this system, disabling"); }
+        graphs_ok
+            && g.supports_resident()
+            && g.preallocate_for_decode(n_embd, vocab_size)
+            && g.ensure_hidden(n_embd)
+            && g.has_q4k("output.weight")
+            && g.has_norm("output_norm.weight")
+            && (0..n_layers as usize).all(|li| {
+                g.has_norm(&format!("blk.{}.attn_norm.weight", li))
+                    && g.has_norm(&format!("blk.{}.ffn_norm.weight", li))
+                    && g.has_weight(&format!("blk.{}.attn_q.weight", li))
+                    && g.has_weight(&format!("blk.{}.attn_k.weight", li))
+                    && g.has_weight(&format!("blk.{}.attn_v.weight", li))
+                    && g.has_weight(&format!("blk.{}.attn_output.weight", li))
+                    && g.has_weight(&format!("blk.{}.ffn_gate.weight", li))
+                    && g.has_weight(&format!("blk.{}.ffn_up.weight", li))
+                    && g.has_weight(&format!("blk.{}.ffn_down.weight", li))
+            })
+    } else { false };
+
+    // No pre-loop capture: each token captures its own fresh graph, so execs never overlap.
+    let cuda_graph_ready = cuda_graph_capable;
+
     // Generation phase (decode)
     let decode_start = Instant::now();
     let mut pos = tokens.len();
+    let mut precomputed_logits: Option<Vec<f32>> = None;
+    let mut graph_hits: u32 = 0;
+    let mut graph_misses: u32 = 0;
     for _ in 0..config.max_tokens {
         if kv_cache.is_full() {
             info!("KV cache full at seq_len={}, stopping", pos);
             break;
         }
+        // Also stop if we're about to overflow the GPU KV cache
+        if cuda_graph_ready && pos >= 511 {
+            info!("GPU KV cache limit reached at pos={}, stopping", pos);
+            break;
+        }
 
         // RMSNorm + output projection.
-        // GPU path: norm on CPU (2048 elems, cheap) then SGEMV on GPU (151936×2048).
-        // CPU fallback: fused quantized matvec on raw Q4K bytes.
-        let mut logits = {
+        // Graph path: logits were computed as part of the previous graph replay.
+        // Otherwise: compute from hidden_dev (GPU) or hidden_state (CPU).
+        let mut logits = if let Some(pl) = precomputed_logits.take() {
+            pl
+        } else {
             let norm_w = streamer
                 .load_named_tensor_f32(gguf, "output_norm.weight")
                 .ok();
@@ -1413,6 +1495,41 @@ pub fn generate(
             }
         }
 
+        // Graph decode path. WDDM Pascal: exec is one-shot; CUgraph is also poisoned after one
+        // launch. Capture a brand-new graph each token, destroy exec+graph after replay.
+        if cuda_graph_ready {
+            if let Some(ref g) = cuda_gpu {
+                if !capture_graph(g) {
+                    info!("per-token recapture failed at pos={}, falling through to resident path", pos);
+                }
+                let t_upload = std::time::Instant::now();
+                let up_ok = g.upload_hidden(&hidden_state) && g.upload_seq_pos(pos);
+                let t_replay = std::time::Instant::now();
+                if up_ok && g.replay_graph_and_sync() {
+                    let t_dtoh = std::time::Instant::now();
+                    if let Some(pl) = g.compute_resident_output_logits(n_embd, vocab_size, rms_eps) {
+                        let t_done = std::time::Instant::now();
+                        if pos < 8 {
+                            tracing::info!(
+                                "graph tok {}: upload={:.2}ms replay={:.2}ms dtoh={:.2}ms",
+                                pos,
+                                t_replay.duration_since(t_upload).as_secs_f64() * 1000.0,
+                                t_dtoh.duration_since(t_replay).as_secs_f64() * 1000.0,
+                                t_done.duration_since(t_dtoh).as_secs_f64() * 1000.0,
+                            );
+                        }
+                        precomputed_logits = Some(pl);
+                        g.advance_kv_seq_lens();
+                        graph_hits += 1;
+                        pos += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        graph_misses += 1;
+
+        // Non-graph path: resident 28-layer forward pass.
         forward_pass(
             gguf,
             streamer,
@@ -1442,6 +1559,9 @@ pub fn generate(
         tokens_per_sec,
         kv_cache.size_bytes() as f64 / (1024.0 * 1024.0)
     );
+    if cuda_graph_ready {
+        info!("CUDA graph: {} hits, {} misses (fallbacks)", graph_hits, graph_misses);
+    }
 
     let text = tokenizer.decode(&generated_tokens);
 
