@@ -11,7 +11,7 @@ use crate::inference::tokenizer::SimpleTokenizer;
 use crate::metal::compute::MetalCompute;
 use crate::metal::gpu::MetalGpu;
 use crate::model::cache::{CachedLayer, LayerCache};
-use crate::model::gguf::GgufFile;
+use crate::model::gguf::{GgufFile, GgmlType};
 use crate::ssd::prefetch::{PrefetchStrategy, Prefetcher};
 use crate::ssd::streamer::SsdStreamer;
 use anyhow::{bail, Result};
@@ -564,13 +564,13 @@ fn forward_pass(
             && (0..effective_layers as usize).all(|li| {
                 g.has_norm(&format!("blk.{}.attn_norm.weight", li))
                     && g.has_norm(&format!("blk.{}.ffn_norm.weight", li))
-                    && g.has(&format!("blk.{}.attn_q.weight", li))
-                    && g.has(&format!("blk.{}.attn_k.weight", li))
-                    && g.has(&format!("blk.{}.attn_v.weight", li))
-                    && g.has(&format!("blk.{}.attn_output.weight", li))
-                    && g.has(&format!("blk.{}.ffn_gate.weight", li))
-                    && g.has(&format!("blk.{}.ffn_up.weight", li))
-                    && g.has(&format!("blk.{}.ffn_down.weight", li))
+                    && g.has_weight(&format!("blk.{}.attn_q.weight", li))
+                    && g.has_weight(&format!("blk.{}.attn_k.weight", li))
+                    && g.has_weight(&format!("blk.{}.attn_v.weight", li))
+                    && g.has_weight(&format!("blk.{}.attn_output.weight", li))
+                    && g.has_weight(&format!("blk.{}.ffn_gate.weight", li))
+                    && g.has_weight(&format!("blk.{}.ffn_up.weight", li))
+                    && g.has_weight(&format!("blk.{}.ffn_down.weight", li))
             });
         if can && g.upload_hidden(hidden_state) {
             let mut success = true;
@@ -1129,14 +1129,21 @@ pub fn generate(
                 for &suffix in &ffn_suffixes {
                     let name = format!("blk.{}.{}", layer_idx, suffix);
                     if let Some(tensor) = gguf.find_tensor(&name) {
-                        if let Ok(data) = streamer.load_tensor_f32(tensor) {
-                            let out_dim = tensor.dimensions[1] as usize;
-                            let in_dim  = tensor.dimensions[0] as usize;
-                            if !g.upload(&name, &data, out_dim, in_dim) {
-                                info!("CUDA: VRAM budget reached at layer {}/{}", layer_idx, n_layers);
-                                budget_full = true;
-                                break;
-                            }
+                        let out_dim = tensor.dimensions[1] as usize;
+                        let in_dim  = tensor.dimensions[0] as usize;
+                        let uploaded = if tensor.dtype == GgmlType::Q4K && in_dim % 256 == 0 {
+                            if let Ok(raw) = streamer.raw_tensor_data(tensor) {
+                                g.upload_q4k(&name, raw, out_dim, in_dim)
+                            } else { false }
+                        } else {
+                            if let Ok(data) = streamer.load_tensor_f32(tensor) {
+                                g.upload(&name, &data, out_dim, in_dim)
+                            } else { false }
+                        };
+                        if !uploaded {
+                            info!("CUDA: VRAM budget reached at layer {}/{}", layer_idx, n_layers);
+                            budget_full = true;
+                            break;
                         }
                     }
                 }
@@ -1144,16 +1151,23 @@ pub fn generate(
             info!("CUDA: {:.0} MB loaded (FFN, {} layers)", g.vram_used_mb(), n_layers);
 
             // Upload output projection BEFORE attn weights so it's guaranteed to fit.
-            // It's the most expensive per-token CPU op (~1.18 GB as f32, 151936×2048).
+            // It's the most expensive per-token CPU op (~175 MB Q4K vs ~1.18 GB f32, 151936×2048).
             if let Some(emb_tensor) = gguf.find_tensor("token_embd.weight") {
                 let in_dim  = emb_tensor.dimensions[0] as usize; // 2048 (hidden dim)
                 let out_dim = emb_tensor.dimensions[1] as usize; // 151936 (vocab size)
-                if let Ok(data) = streamer.load_tensor_f32(emb_tensor) {
-                    if g.upload("output.weight", &data, out_dim, in_dim) {
-                        info!("CUDA: output.weight uploaded ({} × {})", out_dim, in_dim);
-                    } else {
-                        info!("CUDA: output.weight skipped (VRAM full)");
-                    }
+                let uploaded = if emb_tensor.dtype == GgmlType::Q4K && in_dim % 256 == 0 {
+                    if let Ok(raw) = streamer.raw_tensor_data(emb_tensor) {
+                        g.upload_q4k("output.weight", raw, out_dim, in_dim)
+                    } else { false }
+                } else {
+                    if let Ok(data) = streamer.load_tensor_f32(emb_tensor) {
+                        g.upload("output.weight", &data, out_dim, in_dim)
+                    } else { false }
+                };
+                if uploaded {
+                    info!("CUDA: output.weight uploaded ({} × {})", out_dim, in_dim);
+                } else {
+                    info!("CUDA: output.weight skipped (VRAM full)");
                 }
             }
 
@@ -1166,13 +1180,18 @@ pub fn generate(
                 for &suffix in &attn_suffixes {
                     let name = format!("blk.{}.{}", layer_idx, suffix);
                     if let Some(tensor) = gguf.find_tensor(&name) {
-                        if let Ok(data) = streamer.load_tensor_f32(tensor) {
-                            let in_dim  = tensor.dimensions[0] as usize;
-                            let out_dim = tensor.dimensions[1] as usize;
-                            if !g.upload(&name, &data, out_dim, in_dim) {
-                                break 'attn;
-                            }
-                        }
+                        let in_dim  = tensor.dimensions[0] as usize;
+                        let out_dim = tensor.dimensions[1] as usize;
+                        let uploaded = if tensor.dtype == GgmlType::Q4K && in_dim % 256 == 0 {
+                            if let Ok(raw) = streamer.raw_tensor_data(tensor) {
+                                g.upload_q4k(&name, raw, out_dim, in_dim)
+                            } else { false }
+                        } else {
+                            if let Ok(data) = streamer.load_tensor_f32(tensor) {
+                                g.upload(&name, &data, out_dim, in_dim)
+                            } else { false }
+                        };
+                        if !uploaded { break 'attn; }
                     }
                 }
                 attn_layers_loaded += 1;
@@ -1285,7 +1304,11 @@ pub fn generate(
                 .ok();
 
             if let (Some(nw), Some(ref g)) = (norm_w.as_ref(), cuda_gpu.as_ref()) {
-                if g.has("output.weight") {
+                if g.has_q4k("output.weight") {
+                    let mut normed = hidden_state.clone();
+                    rms_norm_eps(&mut normed, nw, rms_eps);
+                    g.sgemv_q4k("output.weight", &normed).unwrap_or_else(|| vec![0.0f32; vocab_size])
+                } else if g.has("output.weight") {
                     let mut normed = hidden_state.clone();
                     rms_norm_eps(&mut normed, nw, rms_eps);
                     g.sgemv("output.weight", &normed).unwrap_or_else(|| vec![0.0f32; vocab_size])
