@@ -66,6 +66,11 @@ impl SsdStreamer {
     }
 
     /// Prefetch a layer — issue madvise WILLNEED for all its tensors
+    /// Return the raw mmap byte slice for a tensor (for background touch prefetch).
+    pub fn tensor_raw_slice<'a>(&'a self, tensor: &TensorInfo) -> Result<&'a [u8]> {
+        self.loader.get_tensor_data(tensor.offset, tensor.size_bytes)
+    }
+
     pub fn prefetch_layer(&self, gguf: &GgufFile, layer_idx: u32) {
         for tensor in gguf.layer_tensors(layer_idx) {
             self.loader.prefetch(tensor.offset, tensor.size_bytes);

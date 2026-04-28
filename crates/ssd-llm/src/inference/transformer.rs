@@ -865,9 +865,15 @@ pub fn generate(
         }
     }
 
-    // No prefetch during decode — model is in OS page cache after prefill.
-    // PrefetchVirtualMemory + VirtualUnlock on Windows cost ~7ms/layer = 196ms/token wasted.
-    let prefetcher = Prefetcher::new(PrefetchStrategy::None);
+    // #3: BackgroundTouch prefetch: touches next-layer mmap pages from a Rayon thread,
+    // avoiding the ~7ms synchronous cost of PrefetchVirtualMemory on the main thread.
+    // For the GPU-resident decode path (CUDA graph active), forward_pass is bypassed
+    // and the prefetcher never fires — zero overhead. Activates for the SSD streaming
+    // fallback path (large models, graph miss), overlapping SSD page-in with GPU compute.
+    #[cfg(target_os = "windows")]
+    let prefetcher = Prefetcher::new(PrefetchStrategy::BackgroundTouch(1));
+    #[cfg(not(target_os = "windows"))]
+    let prefetcher = Prefetcher::new(PrefetchStrategy::LookAhead(1));
     let sampler = build_sampler(config);
 
     // Parse grammar if provided
@@ -1314,22 +1320,30 @@ pub fn generate(
                 let knn_s = format!("blk.{}.attn_k_norm.weight", li);
                 let qnn = if g.has_norm(&qnn_s) { Some(qnn_s.as_str()) } else { None };
                 let knn = if g.has_norm(&knn_s) { Some(knn_s.as_str()) } else { None };
-                if !g.rms_norm_on_hidden(&attn_norm, n_embd, rms_eps)
-                    || !g.attn_fused_resident(li, &qn, &kn, &vn, &on, qnn, knn,
+                // #2: fused norm+SGEMV — one launch per projection instead of norm+SGEMV separate.
+                // Falls back to the two-call path if fused kernels were not compiled.
+                let attn_ok = g.attn_layer_fused_resident(li, &attn_norm, &qn, &kn, &vn, &on,
+                    qnn, knn, n_embd, n_head, n_head_kv, head_dim, rms_eps, theta_base_for_graph);
+                let attn_ok = attn_ok || (
+                    g.rms_norm_on_hidden(&attn_norm, n_embd, rms_eps)
+                    && g.attn_fused_resident(li, &qn, &kn, &vn, &on, qnn, knn,
                            n_embd, n_head, n_head_kv, head_dim, 0, rms_eps, theta_base_for_graph)
-                {
-                    cap_ok = false; break;
-                }
+                );
+                if !attn_ok { cap_ok = false; break; }
                 g.add_hidden_from_y(n_embd);
-                if !g.rms_norm_on_hidden(&ffn_norm, n_embd, rms_eps)
-                    || !g.ffn_fused_resident(&gn, &un, &dn, n_embd)
-                {
-                    cap_ok = false; break;
-                }
+                let ffn_ok = g.ffn_layer_fused_resident(&ffn_norm, &gn, &un, &dn, n_embd, rms_eps);
+                let ffn_ok = ffn_ok || (
+                    g.rms_norm_on_hidden(&ffn_norm, n_embd, rms_eps)
+                    && g.ffn_fused_resident(&gn, &un, &dn, n_embd)
+                );
+                if !ffn_ok { cap_ok = false; break; }
                 g.add_hidden_from_y(n_embd);
             }
+            // #1: fold output norm + logits SGEMV + async D→H into graph.
+            // After graph replay, logits are ready in the pinned buffer — no separate call needed.
+            let logits_in_graph = cap_ok && g.capture_logits_into_graph(n_embd, vocab_size, rms_eps);
             let inst_ok = g.end_capture_and_instantiate();
-            inst_ok && cap_ok
+            inst_ok && cap_ok && logits_in_graph
         } else { false };
         g.restore_kv_seq_lens(kv_saved);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1343,6 +1357,7 @@ pub fn generate(
         graphs_ok
             && g.supports_resident()
             && g.preallocate_for_decode(n_embd, vocab_size)
+            && g.preallocate_pinned_logits(vocab_size)
             && g.ensure_hidden(n_embd)
             && g.has_q4k("output.weight")
             && g.has_norm("output_norm.weight")
@@ -1485,15 +1500,24 @@ pub fn generate(
             acceptor.accept_str(&token_str);
         }
 
-        // Embed new token and forward
-        // Embed new token — row-slice, not full tensor load
-        if let Some(emb_tensor) = gguf.find_tensor("token_embd.weight") {
-            if let Ok(rows) = streamer.load_tensor_rows(emb_tensor, &[token_id], n_embd) {
-                if let Some(emb) = rows.into_iter().next() {
-                    hidden_state = emb;
+        // Embed new token. GPU path dequants output.weight[token_id] → hidden_dev directly
+        // (~0.05ms), replacing the SSD load_tensor_rows call (~6ms).
+        let t_embed_start = std::time::Instant::now();
+        let gpu_embed = if let Some(ref g) = cuda_gpu {
+            g.embed_token_gpu(token_id as usize, n_embd)
+        } else {
+            false
+        };
+        if !gpu_embed {
+            if let Some(emb_tensor) = gguf.find_tensor("token_embd.weight") {
+                if let Ok(rows) = streamer.load_tensor_rows(emb_tensor, &[token_id], n_embd) {
+                    if let Some(emb) = rows.into_iter().next() {
+                        hidden_state = emb;
+                    }
                 }
             }
         }
+        let t_embed_ms = t_embed_start.elapsed().as_secs_f64() * 1000.0;
 
         // Graph decode path. WDDM Pascal: exec is one-shot; CUgraph is also poisoned after one
         // launch. Capture a brand-new graph each token, destroy exec+graph after replay.
@@ -1503,16 +1527,22 @@ pub fn generate(
                     info!("per-token recapture failed at pos={}, falling through to resident path", pos);
                 }
                 let t_upload = std::time::Instant::now();
-                let up_ok = g.upload_hidden(&hidden_state) && g.upload_seq_pos(pos);
+                // Skip upload_hidden when GPU embed already wrote hidden_dev.
+                let up_ok = (gpu_embed || g.upload_hidden(&hidden_state)) && g.upload_seq_pos(pos);
                 let t_replay = std::time::Instant::now();
                 if up_ok && g.replay_graph_and_sync() {
+                    // #1: logits D→H was inside the graph; read from pinned buffer directly.
                     let t_dtoh = std::time::Instant::now();
-                    if let Some(pl) = g.compute_resident_output_logits(n_embd, vocab_size, rms_eps) {
+                    if let Some(pl) = g.read_pinned_logits(vocab_size) {
                         let t_done = std::time::Instant::now();
-                        if pos < 8 {
+                        let capture_ms = t_upload.duration_since(t_embed_start).as_secs_f64() * 1000.0 - t_embed_ms;
+                        if pos < 12 {
                             tracing::info!(
-                                "graph tok {}: upload={:.2}ms replay={:.2}ms dtoh={:.2}ms",
+                                "graph tok {}: embed={:.2}ms({}) capture={:.2}ms upload={:.2}ms replay={:.2}ms logits={:.2}ms",
                                 pos,
+                                t_embed_ms,
+                                if gpu_embed { "gpu" } else { "ssd" },
+                                capture_ms,
                                 t_replay.duration_since(t_upload).as_secs_f64() * 1000.0,
                                 t_dtoh.duration_since(t_replay).as_secs_f64() * 1000.0,
                                 t_done.duration_since(t_dtoh).as_secs_f64() * 1000.0,
@@ -1528,6 +1558,16 @@ pub fn generate(
             }
         }
         graph_misses += 1;
+
+        // Non-graph path: if GPU embed populated hidden_dev but not hidden_state,
+        // download it now so forward_pass gets the correct embedding.
+        if gpu_embed {
+            if let Some(ref g) = cuda_gpu {
+                if let Some(hs) = g.download_hidden() {
+                    hidden_state = hs;
+                }
+            }
+        }
 
         // Non-graph path: resident 28-layer forward pass.
         forward_pass(

@@ -147,6 +147,198 @@ extern "C" __global__ void sgemv_q4k_kernel(
 }
 "#;
 
+    // Q4K row dequant: write hidden_dev[0..n_embd] = dequant(output.weight[token_id]).
+    // Used for GPU-resident token embedding lookup (output.weight tied to token_embd.weight).
+    // grid=(n_embd/256, 1, 1), block=(32, 1, 1): one warp per Q4K block in the row.
+    const DEQUANT_Q4K_ROW_SRC: &str = r#"
+__device__ __forceinline__ float f16_le_to_f32_row(const unsigned char* p) {
+    unsigned int h = (unsigned int)p[0] | ((unsigned int)p[1] << 8u);
+    unsigned int sign = (h & 0x8000u) << 16;
+    unsigned int exp  = (h >> 10) & 0x1Fu;
+    unsigned int mant = h & 0x3FFu;
+    unsigned int bits;
+    if      (exp == 0u)  bits = sign;
+    else if (exp == 31u) bits = sign | 0x7F800000u | (mant << 13);
+    else                 bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    float f; asm("mov.b32 %0, %1;" : "=f"(f) : "r"(bits)); return f;
+}
+extern "C" __global__ void dequant_q4k_row_kernel(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ w,
+    int token_id,
+    int n_embd
+) {
+    int bpr     = n_embd >> 8;
+    int blk_idx = (int)blockIdx.x;
+    int lane    = (int)threadIdx.x;
+    const unsigned char* row_w = w + (long long)token_id * bpr * 144;
+    const unsigned char* blk   = row_w + blk_idx * 144;
+    float d    = f16_le_to_f32_row(blk);
+    float dmin = f16_le_to_f32_row(blk + 2);
+    const unsigned char* sc = blk + 4;
+    const unsigned char* qs = blk + 16;
+    for (int j = 0; j < 8; j++) {
+        int elem = lane + j * 32;
+        int sb   = elem >> 5;
+        int l    = elem & 31;
+        unsigned int sc_low, m_low;
+        if (sb < 4) {
+            sc_low = sc[sb] & 0x3Fu;
+            m_low  = sc[sb + 4] & 0x3Fu;
+        } else {
+            int si4 = sb - 4;
+            sc_low = (sc[sb + 4] & 0x0Fu) | (((unsigned int)sc[si4] >> 6) << 4);
+            m_low  = (sc[sb + 4] >> 4)    | (((unsigned int)sc[si4 + 4] >> 6) << 4);
+        }
+        float scale   = d * (float)sc_low;
+        float min_val = dmin * (float)m_low;
+        int qs_off    = (sb >> 1) * 32 + l;
+        unsigned int byte_val = qs[qs_off];
+        unsigned int nibble   = (sb & 1) ? (byte_val >> 4) : (byte_val & 0x0Fu);
+        out[blk_idx * 256 + elem] = scale * (float)nibble - min_val;
+    }
+}
+"#;
+
+    // Fused RMS-norm + Q4K SGEMV.
+    // Reads hidden[] directly; applies rms_norm inline before the Q4K SGEMV.
+    // Eliminates the separate rms_norm kernel launch and intermediate x_bufs write.
+    //
+    // Shared memory layout (in_dim floats):
+    //   Phase 1: xs[0..1023] = per-thread partial squared sums (reduction scratch)
+    //   Phase 2: xs[0..in_dim] = normalized x (overwrites scratch — safe after sync)
+    //   Phase 3: SGEMV reads xs[0..in_dim]
+    //
+    // Requires in_dim % 256 == 0, in_dim <= 2*blockDim.x (= 2048 for block=1024).
+    // grid=(out_dim/32,1,1), block=(1024,1,1), shared=in_dim*4 bytes.
+    const RMS_NORM_SGEMV_Q4K_SRC: &str = r#"
+__device__ __forceinline__ float f16_le_to_f32_rn(const unsigned char* p) {
+    unsigned int h = (unsigned int)p[0] | ((unsigned int)p[1] << 8u);
+    unsigned int sign = (h & 0x8000u) << 16;
+    unsigned int exp  = (h >> 10) & 0x1Fu;
+    unsigned int mant = h & 0x3FFu;
+    unsigned int bits;
+    if      (exp == 0u)  bits = sign;
+    else if (exp == 31u) bits = sign | 0x7F800000u | (mant << 13);
+    else                 bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    float f; asm("mov.b32 %0, %1;" : "=f"(f) : "r"(bits)); return f;
+}
+extern "C" __global__ void rms_norm_sgemv_q4k_kernel(
+    float* __restrict__ y,
+    const unsigned char* __restrict__ w,
+    const float* __restrict__ hidden,
+    const float* __restrict__ norm_w,
+    int in_dim,
+    float eps
+) {
+    extern __shared__ float xs[];
+    int warp_id = (int)(threadIdx.x >> 5);
+    int lane    = (int)(threadIdx.x & 31);
+    int row     = (int)blockIdx.x * 32 + warp_id;
+    int bpr     = in_dim >> 8;
+
+    // Phase 1: cooperative squared-sum reduction (all 1024 threads)
+    float ss = 0.0f;
+    for (int i = (int)threadIdx.x; i < in_dim; i += 1024) { float v = hidden[i]; ss += v * v; }
+    xs[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s = 512; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) xs[threadIdx.x] += xs[threadIdx.x + s];
+        __syncthreads();
+    }
+    float scale_rms = rsqrtf(xs[0] / (float)in_dim + eps);
+    __syncthreads();
+
+    // Phase 2: write x_norm into shared (overwrites reduction scratch — xs[0] already consumed)
+    for (int i = (int)threadIdx.x; i < in_dim; i += 1024)
+        xs[i] = hidden[i] * scale_rms * norm_w[i];
+    __syncthreads();
+
+    // Phase 3: Q4K SGEMV using xs (same as sgemv_q4k_kernel)
+    const unsigned char* row_w = w + (long long)row * bpr * 144;
+    float partial = 0.0f;
+    for (int b = 0; b < bpr; b++) {
+        const unsigned char* blk = row_w + b * 144;
+        float d    = f16_le_to_f32_rn(blk);
+        float dmin = f16_le_to_f32_rn(blk + 2);
+        const unsigned char* sc = blk + 4;
+        const unsigned char* qs = blk + 16;
+        for (int j = 0; j < 8; j++) {
+            int elem = lane + j * 32;
+            int sb   = elem >> 5;
+            int l    = elem & 31;
+            unsigned int sc_low, m_low;
+            if (sb < 4) {
+                sc_low = sc[sb] & 0x3Fu;
+                m_low  = sc[sb + 4] & 0x3Fu;
+            } else {
+                int si4 = sb - 4;
+                sc_low = (sc[sb + 4] & 0x0Fu) | (((unsigned int)sc[si4] >> 6) << 4);
+                m_low  = ((unsigned int)sc[sb + 4] >> 4) | (((unsigned int)sc[sb] >> 6) << 4);
+            }
+            float sc_val  = d * (float)sc_low;
+            float min_val = dmin * (float)m_low;
+            int qs_off = (sb >> 1) * 32;
+            unsigned int byte_val = qs[qs_off + l];
+            unsigned int nibble   = (sb & 1) ? (byte_val >> 4) : (byte_val & 0x0Fu);
+            partial += (sc_val * (float)nibble - min_val) * xs[b * 256 + elem];
+        }
+    }
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 16);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 8);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 4);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 2);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 1);
+    if (lane == 0) y[row] = partial;
+}
+"#;
+
+    // Fused RMS-norm + f32 SGEMV. Same Phase 1+2 for norm, Phase 3 is f32 dot-product.
+    // grid=(out_dim/32,1,1), block=(1024,1,1), shared=in_dim*4 bytes.
+    const RMS_NORM_SGEMV_F32_SRC: &str = r#"
+extern "C" __global__ void rms_norm_sgemv_f32_kernel(
+    float* __restrict__ y,
+    const float* __restrict__ w,
+    const float* __restrict__ hidden,
+    const float* __restrict__ norm_w,
+    int in_dim,
+    float eps
+) {
+    extern __shared__ float xs[];
+    int warp_id = (int)(threadIdx.x >> 5);
+    int lane    = (int)(threadIdx.x & 31);
+    int row     = (int)blockIdx.x * 32 + warp_id;
+
+    // Phase 1: squared-sum reduction
+    float ss = 0.0f;
+    for (int i = (int)threadIdx.x; i < in_dim; i += 1024) { float v = hidden[i]; ss += v * v; }
+    xs[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s = 512; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) xs[threadIdx.x] += xs[threadIdx.x + s];
+        __syncthreads();
+    }
+    float scale_rms = rsqrtf(xs[0] / (float)in_dim + eps);
+    __syncthreads();
+
+    // Phase 2: x_norm into shared
+    for (int i = (int)threadIdx.x; i < in_dim; i += 1024)
+        xs[i] = hidden[i] * scale_rms * norm_w[i];
+    __syncthreads();
+
+    // Phase 3: f32 SGEMV
+    const float* w_row = w + (long long)row * in_dim;
+    float partial = 0.0f;
+    for (int i = lane; i < in_dim; i += 32) partial += w_row[i] * xs[i];
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 16);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 8);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 4);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 2);
+    partial += __shfl_down_sync(0xFFFFFFFF, partial, 1);
+    if (lane == 0) y[row] = partial;
+}
+"#;
+
     // F32 SGEMV: y = W·x  (row-major W, all f32).
     // Same 32-rows/block shared-mem design as Q4K.
     // grid=(out_dim/32,1,1), block=(1024,1,1), shared=in_dim*4 bytes.
@@ -405,6 +597,8 @@ extern "C" __global__ void attn_fused_kernel(
         hidden_dev: RefCell<Option<CudaSlice<f32>>>,
         /// NVRTC Q4K fused-dequant SGEMV kernel.
         sgemv_q4k_fn: Option<CudaFunction>,
+        /// NVRTC Q4K row-dequant kernel for GPU-resident token embedding.
+        dequant_q4k_row_fn: Option<CudaFunction>,
         /// Q4K weight tensors on device (raw bytes). Key: tensor name. Value: (bytes, out_dim, in_dim).
         q4k_tensors: HashMap<String, (CudaSlice<u8>, usize, usize)>,
         /// NVRTC f32 SGEMV kernel (replaces cuBLAS for f32 tensors).
@@ -423,6 +617,15 @@ extern "C" __global__ void attn_fused_kernel(
         graph_exec_stream: Cell<sys::CUstream>,
         /// True while recording a CUDA stream-capture — suppresses seq_pos htod uploads.
         capturing: Cell<bool>,
+        /// NVRTC fused rms_norm + Q4K SGEMV kernel (eliminates separate norm launch).
+        rms_norm_sgemv_q4k_fn: Option<CudaFunction>,
+        /// NVRTC fused rms_norm + f32 SGEMV kernel.
+        rms_norm_sgemv_f32_fn: Option<CudaFunction>,
+        /// Pinned (page-locked) host buffer for async D→H of output logits inside CUDA graph.
+        /// Allocated once via cuMemHostAlloc; None if allocation failed.
+        logits_pinned: Cell<*mut f32>,
+        /// Size of logits_pinned in elements.
+        logits_pinned_len: Cell<usize>,
     }
 
     impl CudaGpu {
@@ -480,6 +683,17 @@ extern "C" __global__ void attn_fused_kernel(
                 tracing::warn!("CUDA: Q4K SGEMV kernel failed to compile");
             }
 
+            let dequant_q4k_row_fn = (|| -> Option<CudaFunction> {
+                let ptx = compile_ptx(DEQUANT_Q4K_ROW_SRC).ok()?;
+                device.load_ptx(ptx, "dequant_q4k_row", &["dequant_q4k_row_kernel"]).ok()?;
+                device.get_func("dequant_q4k_row", "dequant_q4k_row_kernel")
+            })();
+            if dequant_q4k_row_fn.is_some() {
+                info!("CUDA: Q4K row-dequant kernel compiled (GPU token embedding enabled)");
+            } else {
+                tracing::warn!("CUDA: Q4K row-dequant kernel failed to compile");
+            }
+
             let sgemv_f32_fn = (|| -> Option<CudaFunction> {
                 let ptx = compile_ptx(SGEMV_F32_SRC).ok()?;
                 device.load_ptx(ptx, "sgemv_f32", &["sgemv_f32_kernel"]).ok()?;
@@ -500,6 +714,22 @@ extern "C" __global__ void attn_fused_kernel(
                 info!("CUDA: Q6K SGEMV kernel compiled (on-device Q6K dequant enabled)");
             } else {
                 tracing::warn!("CUDA: Q6K SGEMV kernel failed to compile");
+            }
+
+            let rms_norm_sgemv_q4k_fn = (|| -> Option<CudaFunction> {
+                let ptx = compile_ptx(RMS_NORM_SGEMV_Q4K_SRC).ok()?;
+                device.load_ptx(ptx, "rn_sgemv_q4k", &["rms_norm_sgemv_q4k_kernel"]).ok()?;
+                device.get_func("rn_sgemv_q4k", "rms_norm_sgemv_q4k_kernel")
+            })();
+            let rms_norm_sgemv_f32_fn = (|| -> Option<CudaFunction> {
+                let ptx = compile_ptx(RMS_NORM_SGEMV_F32_SRC).ok()?;
+                device.load_ptx(ptx, "rn_sgemv_f32", &["rms_norm_sgemv_f32_kernel"]).ok()?;
+                device.get_func("rn_sgemv_f32", "rms_norm_sgemv_f32_kernel")
+            })();
+            if rms_norm_sgemv_q4k_fn.is_some() && rms_norm_sgemv_f32_fn.is_some() {
+                info!("CUDA: fused rms_norm+SGEMV kernels compiled (56 norm launches eliminated)");
+            } else {
+                tracing::warn!("CUDA: fused rms_norm+SGEMV kernels failed to compile — falling back to separate norm");
             }
 
             info!(
@@ -528,6 +758,7 @@ extern "C" __global__ void attn_fused_kernel(
                 add_fn,
                 hidden_dev: RefCell::new(None),
                 sgemv_q4k_fn,
+                dequant_q4k_row_fn,
                 q4k_tensors: HashMap::new(),
                 sgemv_f32_fn,
                 sgemv_q6k_fn,
@@ -544,6 +775,10 @@ extern "C" __global__ void attn_fused_kernel(
                     Cell::new(if ok { s } else { std::ptr::null_mut() })
                 },
                 capturing: Cell::new(false),
+                rms_norm_sgemv_q4k_fn,
+                rms_norm_sgemv_f32_fn,
+                logits_pinned: Cell::new(std::ptr::null_mut()),
+                logits_pinned_len: Cell::new(0),
             })
         }
 
@@ -966,6 +1201,28 @@ extern "C" __global__ void attn_fused_kernel(
         /// True if the tensor was uploaded as Q4K bytes.
         pub fn has_q4k(&self, name: &str) -> bool {
             self.q4k_tensors.contains_key(name)
+        }
+
+        /// Dequantize row `token_id` of output.weight (tied embedding) directly into hidden_dev.
+        /// Replaces the ~6ms SSD load_tensor_rows call with a ~0.05ms GPU kernel.
+        /// Returns false if the kernel or required tensors are unavailable.
+        pub fn embed_token_gpu(&self, token_id: usize, n_embd: usize) -> bool {
+            (|| -> Option<()> {
+                let fn_ = self.dequant_q4k_row_fn.as_ref()?;
+                let (w, _out_dim, in_dim) = self.q4k_tensors.get("output.weight")?;
+                if *in_dim != n_embd { return None; }
+                let mut hd = self.hidden_dev.borrow_mut();
+                let hidden = hd.as_mut()?;
+                let cfg = LaunchConfig {
+                    grid_dim: (n_embd as u32 / 256, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe { fn_.clone().launch(cfg, (hidden, w, token_id as i32, n_embd as i32)).ok()? };
+                // Sync so hidden_dev is written before graph_exec_stream reads it.
+                self.device.synchronize().ok()?;
+                Some(())
+            })().is_some()
         }
 
         /// Upload a weight tensor as raw Q6K bytes (210 bytes per 256 values).
@@ -1777,6 +2034,285 @@ extern "C" __global__ void attn_fused_kernel(
             self.device.dtoh_sync_copy(self.y_bufs.borrow().get(&vocab_size)?).ok()
         }
 
+        /// Fused rms_norm + attn SGEMV + attn kernel + Wo SGEMV.
+        /// Reads hidden_dev directly for Q/K/V projections (norm applied inline),
+        /// eliminating the separate rms_norm_on_hidden launch before attn_fused_resident.
+        /// Falls back to returning false if fused kernels are unavailable.
+        pub fn attn_layer_fused_resident(
+            &self,
+            layer_idx: usize,
+            attn_norm_name: &str,
+            q_name: &str, k_name: &str, v_name: &str, wo_name: &str,
+            q_norm_name: Option<&str>, k_norm_name: Option<&str>,
+            n_embd: usize, n_head: usize, n_head_kv: usize, head_dim: usize,
+            rms_eps: f32, theta_base: f32,
+        ) -> bool {
+            // If fused kernels are unavailable, fall back to the two-call path.
+            let q4k_fn = match self.rms_norm_sgemv_q4k_fn.as_ref() {
+                Some(f) => f, None => return false,
+            };
+            let f32_fn = match self.rms_norm_sgemv_f32_fn.as_ref() {
+                Some(f) => f, None => return false,
+            };
+            let fused_attn = match self.attn_fused_kernel_fn.as_ref() {
+                Some(f) => f, None => return false,
+            };
+            (|| -> Option<()> {
+                let norm_w = self.norm_bufs.get(attn_norm_name)?;
+                let hd = self.hidden_dev.borrow();
+                let hidden = hd.as_ref()?;
+                let q_out = n_head * head_dim;
+                let kv_out = n_head_kv * head_dim;
+                let (wo_in_dim, wo_out_dim) = if let Some((_, od, id)) = self.q4k_tensors.get(wo_name) {
+                    (*id, *od)
+                } else {
+                    let t = self.tensors.get(wo_name)?; (t.in_dim, t.out_dim)
+                };
+                if !self.has_weight(q_name) || !self.has_weight(k_name) || !self.has_weight(v_name) { return None; }
+                if !self.ensure_bufs(n_embd, q_out) { return None; }
+                if !self.ensure_k_buf(kv_out) { return None; }
+                if !self.ensure_bufs(n_embd, kv_out) { return None; }
+                if !self.ensure_bufs(wo_in_dim, wo_out_dim) { return None; }
+                if !self.ensure_kv_cache(layer_idx, n_head_kv, head_dim) { return None; }
+                if !self.ensure_seq_pos_dev() { return None; }
+                let seq_pos = *self.kv_seq_lens.borrow().get(&layer_idx).unwrap_or(&0);
+                if !self.capturing.get() && seq_pos >= self.kv_max_seq { return None; }
+                if !self.capturing.get() {
+                    let mut spd = self.seq_pos_dev.borrow_mut();
+                    if let Some(ref mut buf) = *spd {
+                        self.device.htod_sync_copy_into(&[seq_pos as i32], buf).ok()?;
+                    }
+                }
+                let shmem = n_embd as u32 * 4;
+                // Q SGEMV (fused norm+SGEMV, reads hidden_dev)
+                if let Some((wq, _, _)) = self.q4k_tensors.get(q_name) {
+                    let cfg = LaunchConfig { grid_dim: (q_out as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: shmem };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&q_out)?;
+                    unsafe { q4k_fn.clone().launch(cfg, (y, wq, hidden, norm_w, n_embd as i32, rms_eps)).ok()? };
+                } else {
+                    let wq_slice = &self.tensors.get(q_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (q_out as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: shmem };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&q_out)?;
+                    unsafe { f32_fn.clone().launch(cfg, (y, wq_slice, hidden, norm_w, n_embd as i32, rms_eps)).ok()? };
+                }
+                // K SGEMV (fused norm+SGEMV)
+                if let Some((wk, _, _)) = self.q4k_tensors.get(k_name) {
+                    let cfg = LaunchConfig { grid_dim: (kv_out as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: shmem };
+                    let mut kb = self.k_bufs.borrow_mut(); let y = kb.get_mut(&kv_out)?;
+                    unsafe { q4k_fn.clone().launch(cfg, (y, wk, hidden, norm_w, n_embd as i32, rms_eps)).ok()? };
+                } else {
+                    let wk_slice = &self.tensors.get(k_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (kv_out as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: shmem };
+                    let mut kb = self.k_bufs.borrow_mut(); let y = kb.get_mut(&kv_out)?;
+                    unsafe { f32_fn.clone().launch(cfg, (y, wk_slice, hidden, norm_w, n_embd as i32, rms_eps)).ok()? };
+                }
+                // V SGEMV (fused norm+SGEMV)
+                if let Some((wv, _, _)) = self.q4k_tensors.get(v_name) {
+                    let cfg = LaunchConfig { grid_dim: (kv_out as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: shmem };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&kv_out)?;
+                    unsafe { q4k_fn.clone().launch(cfg, (y, wv, hidden, norm_w, n_embd as i32, rms_eps)).ok()? };
+                } else {
+                    let wv_slice = &self.tensors.get(v_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (kv_out as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: shmem };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&kv_out)?;
+                    unsafe { f32_fn.clone().launch(cfg, (y, wv_slice, hidden, norm_w, n_embd as i32, rms_eps)).ok()? };
+                }
+                // Attention kernel + Wo (same as attn_fused_resident)
+                let eps_arg = if q_norm_name.is_some() { rms_eps } else { 0.0f32 };
+                let new_seq_len = seq_pos + 1;
+                let shared_bytes = if self.capturing.get() {
+                    (2 * head_dim + self.kv_max_seq) as u32 * 4
+                } else {
+                    (2 * head_dim + new_seq_len) as u32 * 4
+                };
+                let cfg = LaunchConfig { grid_dim: (n_head as u32, 1, 1), block_dim: (head_dim as u32, 1, 1), shared_mem_bytes: shared_bytes };
+                {
+                    let mut xb = self.x_bufs.borrow_mut();
+                    let ctx_out = xb.get_mut(&wo_in_dim).unwrap();
+                    let mut kkb = self.kv_k_bufs.borrow_mut();
+                    let kk = kkb.get_mut(&layer_idx).unwrap();
+                    let mut kvb = self.kv_v_bufs.borrow_mut();
+                    let kv_v = kvb.get_mut(&layer_idx).unwrap();
+                    let yb = self.y_bufs.borrow();
+                    let q_dev = yb.get(&q_out).unwrap();
+                    let v_dev = yb.get(&kv_out).unwrap();
+                    let kb = self.k_bufs.borrow();
+                    let k_dev = kb.get(&kv_out).unwrap();
+                    let q_norm_w = q_norm_name.and_then(|n| self.norm_bufs.get(n)).unwrap_or(q_dev);
+                    let k_norm_w = k_norm_name.and_then(|n| self.norm_bufs.get(n)).unwrap_or(k_dev);
+                    let spd = self.seq_pos_dev.borrow();
+                    let seq_pos_ptr = spd.as_ref()?;
+                    let kv_group_size = (n_head / n_head_kv).max(1) as i32;
+                    unsafe { fused_attn.clone().launch(cfg, (ctx_out, kk, kv_v, q_dev, k_dev, v_dev, q_norm_w, k_norm_w, seq_pos_ptr, eps_arg, theta_base, kv_group_size)).ok()? };
+                }
+                *self.kv_seq_lens.borrow_mut().entry(layer_idx).or_insert(0) = new_seq_len;
+                // Wo SGEMV
+                let wo_sgemv_fn = self.sgemv_q4k_fn.as_ref()?;
+                if let Some((wwo, _, _)) = self.q4k_tensors.get(wo_name) {
+                    let cfg = LaunchConfig { grid_dim: (wo_out_dim as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: wo_in_dim as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&wo_out_dim)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&wo_in_dim)?;
+                    unsafe { wo_sgemv_fn.clone().launch(cfg, (y, wwo, xd, wo_in_dim as i32)).ok()? };
+                } else if let Some(f32_sgemv) = self.sgemv_f32_fn.as_ref() {
+                    let wwo_slice = &self.tensors.get(wo_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (wo_out_dim as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: wo_in_dim as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&wo_out_dim)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&wo_in_dim)?;
+                    unsafe { f32_sgemv.clone().launch(cfg, (y, wwo_slice, xd, wo_in_dim as i32)).ok()? };
+                } else { return None; }
+                Some(())
+            })().is_some()
+        }
+
+        /// Fused rms_norm + FFN (gate/up/silu/down).
+        /// Reads hidden_dev directly for gate and up projections (norm applied inline),
+        /// eliminating the separate rms_norm_on_hidden launch before ffn_fused_resident.
+        pub fn ffn_layer_fused_resident(
+            &self,
+            ffn_norm_name: &str,
+            gate_name: &str, up_name: &str, down_name: &str,
+            n_embd: usize, rms_eps: f32,
+        ) -> bool {
+            let q4k_fn = match self.rms_norm_sgemv_q4k_fn.as_ref() {
+                Some(f) => f, None => return false,
+            };
+            let f32_fn_opt = self.rms_norm_sgemv_f32_fn.as_ref();
+            (|| -> Option<()> {
+                let silu_had = self.silu_had_fn.as_ref()?;
+                let norm_w = self.norm_bufs.get(ffn_norm_name)?;
+                let hd = self.hidden_dev.borrow();
+                let hidden = hd.as_ref()?;
+                let (in_dim, n_ff) = if let Some((_, od, id)) = self.q4k_tensors.get(gate_name) {
+                    (*id, *od)
+                } else {
+                    let tg = self.tensors.get(gate_name)?; (tg.in_dim, tg.out_dim)
+                };
+                let out_dim = if let Some((_, od, _)) = self.q4k_tensors.get(down_name) {
+                    *od
+                } else if let Some((_, od, _)) = self.q6k_tensors.get(down_name) {
+                    *od
+                } else {
+                    self.tensors.get(down_name)?.out_dim
+                };
+                if !self.ensure_bufs(in_dim, n_ff) { return None; }
+                if !self.ensure_up_buf(n_ff) { return None; }
+                if !self.ensure_bufs(n_ff, out_dim) { return None; }
+                let shmem = in_dim as u32 * 4;
+                // Gate SGEMV (fused norm+SGEMV)
+                if let Some((wg, _, _)) = self.q4k_tensors.get(gate_name) {
+                    let cfg = LaunchConfig { grid_dim: (n_ff as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: shmem };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&n_ff)?;
+                    unsafe { q4k_fn.clone().launch(cfg, (y, wg, hidden, norm_w, in_dim as i32, rms_eps)).ok()? };
+                } else if let Some(f32_fn) = f32_fn_opt {
+                    let wg_slice = &self.tensors.get(gate_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (n_ff as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: shmem };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&n_ff)?;
+                    unsafe { f32_fn.clone().launch(cfg, (y, wg_slice, hidden, norm_w, in_dim as i32, rms_eps)).ok()? };
+                } else { return None; }
+                // Up SGEMV (fused norm+SGEMV)
+                if let Some((wu, _, _)) = self.q4k_tensors.get(up_name) {
+                    let cfg = LaunchConfig { grid_dim: (n_ff as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: shmem };
+                    let mut ub = self.up_bufs.borrow_mut(); let y = ub.get_mut(&n_ff)?;
+                    unsafe { q4k_fn.clone().launch(cfg, (y, wu, hidden, norm_w, in_dim as i32, rms_eps)).ok()? };
+                } else if let Some(f32_fn) = f32_fn_opt {
+                    let wu_slice = &self.tensors.get(up_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (n_ff as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: shmem };
+                    let mut ub = self.up_bufs.borrow_mut(); let y = ub.get_mut(&n_ff)?;
+                    unsafe { f32_fn.clone().launch(cfg, (y, wu_slice, hidden, norm_w, in_dim as i32, rms_eps)).ok()? };
+                } else { return None; }
+                // silu(gate) * up → x_bufs[n_ff]
+                { let cfg_k = LaunchConfig::for_num_elems(n_ff as u32); let mut yb = self.y_bufs.borrow_mut(); let gate_dev = yb.get_mut(&n_ff).unwrap(); let ub = self.up_bufs.borrow(); let up_dev = ub.get(&n_ff).unwrap(); let mut xb = self.x_bufs.borrow_mut(); let out_dev = xb.get_mut(&n_ff).unwrap(); unsafe { silu_had.clone().launch(cfg_k, (gate_dev, up_dev, out_dev, n_ff as i32)).ok()? }; }
+                // Down SGEMV: x_bufs[n_ff] → y_bufs[out_dim]
+                if let Some((wd, _, _)) = self.q4k_tensors.get(down_name) {
+                    let fn_ = self.sgemv_q4k_fn.as_ref()?;
+                    let cfg = LaunchConfig { grid_dim: (out_dim as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: n_ff as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&out_dim)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&n_ff)?;
+                    unsafe { fn_.clone().launch(cfg, (y, wd, xd, n_ff as i32)).ok()? };
+                } else if let Some((wd, _, _)) = self.q6k_tensors.get(down_name) {
+                    let fn_ = self.sgemv_q6k_fn.as_ref()?;
+                    let cfg = LaunchConfig { grid_dim: (out_dim as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: n_ff as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&out_dim)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&n_ff)?;
+                    unsafe { fn_.clone().launch(cfg, (y, wd, xd, n_ff as i32)).ok()? };
+                } else {
+                    let fn_ = self.sgemv_f32_fn.as_ref()?;
+                    let wd_slice = &self.tensors.get(down_name)?.slice;
+                    let cfg = LaunchConfig { grid_dim: (out_dim as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: n_ff as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&out_dim)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&n_ff)?;
+                    unsafe { fn_.clone().launch(cfg, (y, wd_slice, xd, n_ff as i32)).ok()? };
+                }
+                let _ = n_embd; // used for API symmetry
+                Some(())
+            })().is_some()
+        }
+
+        /// Allocate a page-locked host buffer for logits (for async D→H inside CUDA graph).
+        /// Must be called before graph capture. Idempotent.
+        pub fn preallocate_pinned_logits(&self, vocab_size: usize) -> bool {
+            if !self.logits_pinned.get().is_null() { return true; }
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let bytes = vocab_size * std::mem::size_of::<f32>();
+            let ok = unsafe {
+                // CU_MEMHOSTALLOC_PORTABLE = 0x01, CU_MEMHOSTALLOC_WRITECOMBINED = 0x04
+                // Use 0 flags for standard pinned memory (host-readable after D→H)
+                sys::lib().cuMemHostAlloc(&mut ptr, bytes, 0).result().is_ok()
+            };
+            if ok && !ptr.is_null() {
+                self.logits_pinned.set(ptr as *mut f32);
+                self.logits_pinned_len.set(vocab_size);
+                true
+            } else { false }
+        }
+
+        /// Capture output-norm + output.weight SGEMV + async D→H to pinned buffer into graph.
+        /// Call during stream capture (between begin_capture and end_capture_and_instantiate).
+        /// After graph replay, read logits via read_pinned_logits().
+        pub fn capture_logits_into_graph(&self, n_embd: usize, vocab_size: usize, rms_eps: f32) -> bool {
+            (|| -> Option<()> {
+                let pinned = self.logits_pinned.get();
+                if pinned.is_null() { return None; }
+                if self.logits_pinned_len.get() != vocab_size { return None; }
+                // rms_norm(hidden_dev → x_bufs[n_embd]) — reuse existing norm kernel
+                if !self.rms_norm_on_hidden("output_norm.weight", n_embd, rms_eps) { return None; }
+                // Q4K SGEMV: output.weight, x_bufs[n_embd] → y_bufs[vocab_size]
+                let fn_ = self.sgemv_q4k_fn.as_ref()?;
+                if !self.ensure_bufs(n_embd, vocab_size) { return None; }
+                {
+                    let (w, _, _) = self.q4k_tensors.get("output.weight")?;
+                    let cfg = LaunchConfig { grid_dim: (vocab_size as u32 / 32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: n_embd as u32 * 4 };
+                    let mut yb = self.y_bufs.borrow_mut(); let y = yb.get_mut(&vocab_size)?;
+                    let xb = self.x_bufs.borrow(); let xd = xb.get(&n_embd)?;
+                    unsafe { fn_.clone().launch(cfg, (y, w, xd, n_embd as i32)).ok()? };
+                }
+                // Async D→H to pinned buffer — capturable as a memcpy node in the graph.
+                let yb = self.y_bufs.borrow();
+                let y_dev = yb.get(&vocab_size)?;
+                let src_ptr = *y_dev.device_ptr();
+                let stream = *self.device.cu_stream();
+                unsafe {
+                    sys::lib().cuMemcpyDtoHAsync_v2(
+                        pinned as *mut std::ffi::c_void,
+                        src_ptr,
+                        vocab_size * std::mem::size_of::<f32>(),
+                        stream,
+                    ).result().ok()?;
+                }
+                Some(())
+            })().is_some()
+        }
+
+        /// Read logits from the pinned buffer after graph replay.
+        /// Returns None if pinned buffer is not allocated or wrong size.
+        pub fn read_pinned_logits(&self, vocab_size: usize) -> Option<Vec<f32>> {
+            let pinned = self.logits_pinned.get();
+            if pinned.is_null() || self.logits_pinned_len.get() != vocab_size { return None; }
+            // After graph replay + sync, the pinned buffer already contains the result.
+            let slice = unsafe { std::slice::from_raw_parts(pinned, vocab_size) };
+            Some(slice.to_vec())
+        }
+
         pub fn vram_used_mb(&self) -> f64 {
             self.vram_used as f64 / (1024.0 * 1024.0)
         }
@@ -1808,6 +2344,10 @@ extern "C" __global__ void attn_fused_kernel(
             if !s.is_null() {
                 unsafe { sys::lib().cuStreamDestroy_v2(s).result().ok(); }
             }
+            let ptr = self.logits_pinned.get();
+            if !ptr.is_null() {
+                unsafe { sys::lib().cuMemFreeHost(ptr as *mut std::ffi::c_void).result().ok(); }
+            }
         }
     }
 }
@@ -1832,6 +2372,7 @@ impl CudaGpu {
     pub fn has(&self, _: &str) -> bool { false }
     pub fn has_norm(&self, _: &str) -> bool { false }
     pub fn has_q4k(&self, _: &str) -> bool { false }
+    pub fn embed_token_gpu(&self, _: usize, _: usize) -> bool { false }
     pub fn has_q6k(&self, _: &str) -> bool { false }
     pub fn has_weight(&self, _: &str) -> bool { false }
     pub fn sgemv(&self, _: &str, _: &[f32]) -> Option<Vec<f32>> { None }
@@ -1864,4 +2405,10 @@ impl CudaGpu {
     pub fn compute_resident_logits_no_sync(&self, _: usize, _: usize, _: f32) -> bool { false }
     pub fn compute_resident_output_logits(&self, _: usize, _: usize, _: f32) -> Option<Vec<f32>> { None }
     pub fn download_logits(&self, _: usize) -> Option<Vec<f32>> { None }
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_layer_fused_resident(&self, _: usize, _: &str, _: &str, _: &str, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: usize, _: usize, _: usize, _: usize, _: f32, _: f32) -> bool { false }
+    pub fn ffn_layer_fused_resident(&self, _: &str, _: &str, _: &str, _: &str, _: usize, _: f32) -> bool { false }
+    pub fn preallocate_pinned_logits(&self, _: usize) -> bool { false }
+    pub fn capture_logits_into_graph(&self, _: usize, _: usize, _: f32) -> bool { false }
+    pub fn read_pinned_logits(&self, _: usize) -> Option<Vec<f32>> { None }
 }
