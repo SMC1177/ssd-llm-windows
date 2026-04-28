@@ -555,6 +555,67 @@ fn forward_pass(
         .unwrap_or(n_layers);
     let effective_layers = n_layers.min(max_layers);
 
+    // GPU-resident path: all layers run without per-layer CPU<→GPU sync.
+    // Requires: all weight tensors + norm weights pre-uploaded, rms_norm+add kernels compiled.
+    // 1 htod (hidden) + 1 dtoh (hidden) replaces 4 syncs/layer × 28 layers = 112 → 2 syncs.
+    let used_resident = if let Some(g) = gpu {
+        let can = g.supports_resident()
+            && g.ensure_hidden(n_embd)
+            && (0..effective_layers as usize).all(|li| {
+                g.has_norm(&format!("blk.{}.attn_norm.weight", li))
+                    && g.has_norm(&format!("blk.{}.ffn_norm.weight", li))
+                    && g.has(&format!("blk.{}.attn_q.weight", li))
+                    && g.has(&format!("blk.{}.attn_k.weight", li))
+                    && g.has(&format!("blk.{}.attn_v.weight", li))
+                    && g.has(&format!("blk.{}.attn_output.weight", li))
+                    && g.has(&format!("blk.{}.ffn_gate.weight", li))
+                    && g.has(&format!("blk.{}.ffn_up.weight", li))
+                    && g.has(&format!("blk.{}.ffn_down.weight", li))
+            });
+        if can && g.upload_hidden(hidden_state) {
+            let mut success = true;
+            for li in 0..effective_layers as usize {
+                let attn_norm = format!("blk.{}.attn_norm.weight", li);
+                let ffn_norm  = format!("blk.{}.ffn_norm.weight", li);
+                let qn  = format!("blk.{}.attn_q.weight", li);
+                let kn  = format!("blk.{}.attn_k.weight", li);
+                let vn  = format!("blk.{}.attn_v.weight", li);
+                let on  = format!("blk.{}.attn_output.weight", li);
+                let gn  = format!("blk.{}.ffn_gate.weight", li);
+                let un  = format!("blk.{}.ffn_up.weight", li);
+                let dn  = format!("blk.{}.ffn_down.weight", li);
+                let qnn_s = format!("blk.{}.attn_q_norm.weight", li);
+                let knn_s = format!("blk.{}.attn_k_norm.weight", li);
+                let qnn = if g.has_norm(&qnn_s) { Some(qnn_s.as_str()) } else { None };
+                let knn = if g.has_norm(&knn_s) { Some(knn_s.as_str()) } else { None };
+
+                if !g.rms_norm_on_hidden(&attn_norm, n_embd, rms_eps)
+                    || !g.attn_fused_resident(li, &qn, &kn, &vn, &on, qnn, knn, n_embd, n_head, n_head_kv, head_dim, position, rms_eps, theta_base)
+                {
+                    success = false; break;
+                }
+                g.add_hidden_from_y(n_embd);
+
+                if !g.rms_norm_on_hidden(&ffn_norm, n_embd, rms_eps)
+                    || !g.ffn_fused_resident(&gn, &un, &dn, n_embd)
+                {
+                    success = false; break;
+                }
+                g.add_hidden_from_y(n_embd);
+            }
+            if success {
+                if let Some(h) = g.download_hidden() {
+                    *hidden_state = h;
+                    return Ok(());
+                }
+            }
+        }
+        false
+    } else {
+        false
+    };
+    let _ = used_resident;
+
     for layer_idx in 0..effective_layers {
         prefetcher.on_layer_start(layer_idx, n_layers, streamer, gguf, layer_cache);
 
@@ -1138,6 +1199,23 @@ pub fn generate(
             }
             if qk_norm_count > 0 {
                 info!("CUDA: {} QK-norm weights uploaded", qk_norm_count);
+            }
+
+            // Pre-upload attn_norm + ffn_norm + output_norm for GPU-resident forward pass.
+            let mut layer_norm_count = 0u32;
+            for layer_idx in 0..n_layers {
+                for suffix in &["attn_norm.weight", "ffn_norm.weight"] {
+                    let name = format!("blk.{}.{}", layer_idx, suffix);
+                    if let Ok(data) = streamer.load_named_tensor_f32(gguf, &name) {
+                        if g.upload_norm(&name, &data) { layer_norm_count += 1; }
+                    }
+                }
+            }
+            if let Ok(data) = streamer.load_named_tensor_f32(gguf, "output_norm.weight") {
+                g.upload_norm("output_norm.weight", &data);
+            }
+            if layer_norm_count > 0 {
+                info!("CUDA: {} layer norm weights uploaded (GPU-resident forward pass ready)", layer_norm_count);
             }
         }
         gpu

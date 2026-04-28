@@ -33,6 +33,34 @@ extern "C" __global__ void silu_hadamard(float* gate, const float* up, float* ou
 }
 "#;
 
+    // RMS norm: out[i] = x[i] / sqrt(mean(x²)+eps) * w[i]
+    // Grid: (1,1,1), Block: (256,1,1), Shared: 256×4 bytes
+    const RMS_NORM_SRC: &str = r#"
+extern "C" __global__ void rms_norm_kernel(
+    float* out, const float* x, const float* w, int n, float eps
+) {
+    extern __shared__ float s[];
+    int t = threadIdx.x, B = blockDim.x;
+    float ss = 0.0f;
+    for (int i = t; i < n; i += B) { float v = x[i]; ss += v * v; }
+    s[t] = ss; __syncthreads();
+    for (int stride = B >> 1; stride > 0; stride >>= 1) {
+        if (t < stride) s[t] += s[t + stride]; __syncthreads();
+    }
+    float scale = rsqrtf(s[0] / (float)n + eps);
+    for (int i = t; i < n; i += B) out[i] = x[i] * scale * w[i];
+}
+"#;
+
+    // Elementwise add in-place: x[i] += y[i]
+    // Grid: (ceil(n/256),1,1), Block: (256,1,1)
+    const ADD_INPLACE_SRC: &str = r#"
+extern "C" __global__ void add_inplace_kernel(float* x, const float* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+"#;
+
     // Fused attention kernel: one launch replaces qk_norm(Q+K) + rope(Q+K) + kv_append + attn_compute.
     // Saves 4 extra WDDM launches vs 5-separate-kernels (each ~50µs on Windows WDDM).
     //
@@ -192,6 +220,12 @@ extern "C" __global__ void attn_fused_kernel(
         norm_bufs: HashMap<String, CudaSlice<f32>>,
         /// NVRTC fused attention kernel (qk_norm+rope+kv_append+attn in one launch).
         attn_fused_kernel_fn: Option<CudaFunction>,
+        /// NVRTC RMS-norm kernel (for GPU-resident forward pass).
+        rms_norm_fn: Option<CudaFunction>,
+        /// NVRTC elementwise add-inplace kernel.
+        add_fn: Option<CudaFunction>,
+        /// Persistent on-device hidden state for GPU-resident forward pass.
+        hidden_dev: RefCell<Option<CudaSlice<f32>>>,
     }
 
     impl CudaGpu {
@@ -224,6 +258,20 @@ extern "C" __global__ void attn_fused_kernel(
                 tracing::warn!("CUDA: fused attention kernel failed to compile — GPU attention disabled");
             }
 
+            let rms_norm_fn = (|| -> Option<CudaFunction> {
+                let ptx = compile_ptx(RMS_NORM_SRC).ok()?;
+                device.load_ptx(ptx, "rms_norm_k", &["rms_norm_kernel"]).ok()?;
+                device.get_func("rms_norm_k", "rms_norm_kernel")
+            })();
+            let add_fn = (|| -> Option<CudaFunction> {
+                let ptx = compile_ptx(ADD_INPLACE_SRC).ok()?;
+                device.load_ptx(ptx, "add_k", &["add_inplace_kernel"]).ok()?;
+                device.get_func("add_k", "add_inplace_kernel")
+            })();
+            if rms_norm_fn.is_some() && add_fn.is_some() {
+                info!("CUDA: rms_norm + add_inplace kernels compiled (GPU-resident forward pass enabled)");
+            }
+
             info!(
                 "CUDA GPU ready: device 0, VRAM budget {:.1} GB",
                 vram_budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -246,6 +294,9 @@ extern "C" __global__ void attn_fused_kernel(
                 kv_max_seq: 512,
                 norm_bufs: HashMap::new(),
                 attn_fused_kernel_fn,
+                rms_norm_fn,
+                add_fn,
+                hidden_dev: RefCell::new(None),
             })
         }
 
@@ -832,6 +883,154 @@ extern "C" __global__ void attn_fused_kernel(
             Some(self.h_bufs.borrow().get(&wo_out_dim).unwrap().clone())
         }
 
+        // ── GPU-resident forward pass helpers ────────────────────────────────────
+
+        /// Returns true if rms_norm + add kernels are available (GPU-resident capable).
+        pub fn supports_resident(&self) -> bool {
+            self.rms_norm_fn.is_some() && self.add_fn.is_some() && self.attn_fused_kernel_fn.is_some() && self.silu_had_fn.is_some()
+        }
+
+        /// Allocate hidden_dev if not already allocated.
+        pub fn ensure_hidden(&self, n: usize) -> bool {
+            let mut hd = self.hidden_dev.borrow_mut();
+            if hd.is_none() {
+                match self.device.alloc_zeros::<f32>(n) {
+                    Ok(buf) => { *hd = Some(buf); true }
+                    Err(_) => false,
+                }
+            } else {
+                true
+            }
+        }
+
+        /// Upload hidden state to device (1 htod for the entire forward pass).
+        pub fn upload_hidden(&self, data: &[f32]) -> bool {
+            let mut hd = self.hidden_dev.borrow_mut();
+            if let Some(ref mut buf) = *hd {
+                self.device.htod_sync_copy_into(data, buf).is_ok()
+            } else {
+                false
+            }
+        }
+
+        /// Download hidden state from device (1 dtoh for the entire forward pass).
+        pub fn download_hidden(&self) -> Option<Vec<f32>> {
+            let hd = self.hidden_dev.borrow();
+            self.device.dtoh_sync_copy(hd.as_ref()?).ok()
+        }
+
+        /// GPU RMS norm: reads hidden_dev, writes normed result to x_bufs[n] (SGEMV input).
+        pub fn rms_norm_on_hidden(&self, norm_name: &str, n: usize, eps: f32) -> bool {
+            (|| -> Option<()> {
+                let fn_ = self.rms_norm_fn.as_ref()?;
+                let norm_w = self.norm_bufs.get(norm_name)?;
+                if !self.ensure_bufs(n, n) { return None; }
+                let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 256 * 4 };
+                let hd = self.hidden_dev.borrow();
+                let hidden = hd.as_ref()?;
+                let mut xb = self.x_bufs.borrow_mut();
+                let out = xb.get_mut(&n).unwrap();
+                unsafe { fn_.clone().launch(cfg, (out, hidden, norm_w, n as i32, eps)).ok()? };
+                Some(())
+            })().is_some()
+        }
+
+        /// GPU residual add: hidden_dev += y_bufs[n]  (result of last SGEMV).
+        pub fn add_hidden_from_y(&self, n: usize) -> bool {
+            (|| -> Option<()> {
+                let fn_ = self.add_fn.as_ref()?;
+                let blocks = ((n + 255) / 256) as u32;
+                let cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                let mut hd = self.hidden_dev.borrow_mut();
+                let hidden = hd.as_mut()?;
+                let yb = self.y_bufs.borrow();
+                let delta = yb.get(&n)?;
+                unsafe { fn_.clone().launch(cfg, (hidden, delta, n as i32)).ok()? };
+                Some(())
+            })().is_some()
+        }
+
+        /// Like attn_fused but reads x from x_bufs[n_embd] (set by rms_norm_on_hidden) and
+        /// leaves Wo output in y_bufs[n_embd] — no htod, no dtoh.
+        pub fn attn_fused_resident(
+            &self,
+            layer_idx: usize,
+            q_name: &str, k_name: &str, v_name: &str, wo_name: &str,
+            q_norm_name: Option<&str>, k_norm_name: Option<&str>,
+            n_embd: usize, n_head: usize, n_head_kv: usize, head_dim: usize,
+            position: usize, rms_eps: f32, theta_base: f32,
+        ) -> bool {
+            (|| -> Option<()> {
+                let fused_fn = self.attn_fused_kernel_fn.as_ref()?;
+                if head_dim == 0 || (head_dim & (head_dim - 1)) != 0 { return None; }
+                let q_out = n_head * head_dim;
+                let kv_out = n_head_kv * head_dim;
+                let kv_group_size = (n_head / n_head_kv).max(1) as i32;
+                let (wo_in_dim, wo_out_dim) = { let t = self.tensors.get(wo_name)?; (t.in_dim, t.out_dim) };
+                if !self.tensors.contains_key(q_name) || !self.tensors.contains_key(k_name) || !self.tensors.contains_key(v_name) { return None; }
+                // x_bufs[n_embd] already populated by rms_norm_on_hidden — skip htod
+                if !self.ensure_bufs(n_embd, q_out) { return None; }
+                if !self.ensure_k_buf(kv_out) { return None; }
+                if !self.ensure_bufs(n_embd, kv_out) { return None; }
+                if !self.ensure_bufs(wo_in_dim, wo_out_dim) { return None; }
+                if !self.ensure_kv_cache(layer_idx, n_head_kv, head_dim) { return None; }
+                let seq_pos = *self.kv_seq_lens.borrow().get(&layer_idx).unwrap_or(&0);
+                if seq_pos >= self.kv_max_seq { return None; }
+                // Q/K/V SGEMVs (x already on device)
+                { let tq = self.tensors.get(q_name)?; unsafe { self.blas.gemv(Self::gemv_cfg(n_embd, q_out), &tq.slice, self.x_bufs.borrow().get(&n_embd).unwrap(), self.y_bufs.borrow_mut().get_mut(&q_out).unwrap()).ok()? }; }
+                { let tk = self.tensors.get(k_name)?; unsafe { self.blas.gemv(Self::gemv_cfg(n_embd, kv_out), &tk.slice, self.x_bufs.borrow().get(&n_embd).unwrap(), self.k_bufs.borrow_mut().get_mut(&kv_out).unwrap()).ok()? }; }
+                { let tv = self.tensors.get(v_name)?; unsafe { self.blas.gemv(Self::gemv_cfg(n_embd, kv_out), &tv.slice, self.x_bufs.borrow().get(&n_embd).unwrap(), self.y_bufs.borrow_mut().get_mut(&kv_out).unwrap()).ok()? }; }
+                // Single fused kernel
+                let eps_arg = if q_norm_name.is_some() { rms_eps } else { 0.0f32 };
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+                let new_seq_len = seq_pos + 1;
+                let shared_bytes = (2 * head_dim + new_seq_len) as u32 * 4;
+                let cfg = LaunchConfig { grid_dim: (n_head as u32, 1, 1), block_dim: (head_dim as u32, 1, 1), shared_mem_bytes: shared_bytes };
+                {
+                    let mut xb = self.x_bufs.borrow_mut();
+                    let ctx_out = xb.get_mut(&wo_in_dim).unwrap();
+                    let mut kkb = self.kv_k_bufs.borrow_mut();
+                    let kk = kkb.get_mut(&layer_idx).unwrap();
+                    let mut kvb = self.kv_v_bufs.borrow_mut();
+                    let kv_v = kvb.get_mut(&layer_idx).unwrap();
+                    let yb = self.y_bufs.borrow();
+                    let q_dev = yb.get(&q_out).unwrap();
+                    let v_dev = yb.get(&kv_out).unwrap();
+                    let kb = self.k_bufs.borrow();
+                    let k_dev = kb.get(&kv_out).unwrap();
+                    let q_norm_w = q_norm_name.and_then(|n| self.norm_bufs.get(n)).unwrap_or(q_dev);
+                    let k_norm_w = k_norm_name.and_then(|n| self.norm_bufs.get(n)).unwrap_or(k_dev);
+                    unsafe { fused_fn.clone().launch(cfg, (ctx_out, kk, kv_v, q_dev, k_dev, v_dev, q_norm_w, k_norm_w, seq_pos as i32, eps_arg, theta_base, kv_group_size)).ok()? };
+                }
+                *self.kv_seq_lens.borrow_mut().entry(layer_idx).or_insert(0) = new_seq_len;
+                // Wo SGEMV → y_bufs[wo_out_dim] (no dtoh; caller reads via add_hidden_from_y)
+                { let two = self.tensors.get(wo_name)?; unsafe { self.blas.gemv(Self::gemv_cfg(wo_in_dim, wo_out_dim), &two.slice, self.x_bufs.borrow().get(&wo_in_dim).unwrap(), self.y_bufs.borrow_mut().get_mut(&wo_out_dim).unwrap()).ok()? }; }
+                Some(())
+            })().is_some()
+        }
+
+        /// Like ffn_fused but reads x from x_bufs[n_embd] (set by rms_norm_on_hidden) and
+        /// leaves down output in y_bufs[n_embd] — no htod, no dtoh.
+        pub fn ffn_fused_resident(&self, gate_name: &str, up_name: &str, down_name: &str, n_embd: usize) -> bool {
+            (|| -> Option<()> {
+                let silu_had = self.silu_had_fn.as_ref()?;
+                let (in_dim, n_ff) = { let tg = self.tensors.get(gate_name)?; (tg.in_dim, tg.out_dim) };
+                let out_dim = { self.tensors.get(down_name)?.out_dim };
+                // x_bufs[n_embd] already populated — skip htod
+                if !self.ensure_bufs(in_dim, n_ff) { return None; }
+                if !self.ensure_up_buf(n_ff) { return None; }
+                if !self.ensure_bufs(n_ff, out_dim) { return None; }
+                let cfg_gu = Self::gemv_cfg(in_dim, n_ff);
+                { let tg = self.tensors.get(gate_name)?; unsafe { self.blas.gemv(cfg_gu, &tg.slice, self.x_bufs.borrow().get(&in_dim).unwrap(), self.y_bufs.borrow_mut().get_mut(&n_ff).unwrap()).ok()? }; }
+                { let tu = self.tensors.get(up_name)?; unsafe { self.blas.gemv(cfg_gu, &tu.slice, self.x_bufs.borrow().get(&in_dim).unwrap(), self.up_bufs.borrow_mut().get_mut(&n_ff).unwrap()).ok()? }; }
+                { let cfg_k = LaunchConfig::for_num_elems(n_ff as u32); let mut yb = self.y_bufs.borrow_mut(); let gate_dev = yb.get_mut(&n_ff).unwrap(); let ub = self.up_bufs.borrow(); let up_dev = ub.get(&n_ff).unwrap(); let mut xb = self.x_bufs.borrow_mut(); let out_dev = xb.get_mut(&n_ff).unwrap(); unsafe { silu_had.clone().launch(cfg_k, (gate_dev, up_dev, out_dev, n_ff as i32)).ok()? }; }
+                { let cfg_d = Self::gemv_cfg(n_ff, out_dim); let td = self.tensors.get(down_name)?; unsafe { self.blas.gemv(cfg_d, &td.slice, self.x_bufs.borrow().get(&n_ff).unwrap(), self.y_bufs.borrow_mut().get_mut(&out_dim).unwrap()).ok()? }; }
+                // No dtoh — caller reads via add_hidden_from_y
+                let _ = n_embd; // suppress unused warning (out_dim == n_embd by construction)
+                Some(())
+            })().is_some()
+        }
+
         pub fn vram_used_mb(&self) -> f64 {
             self.vram_used as f64 / (1024.0 * 1024.0)
         }
@@ -874,5 +1073,14 @@ impl CudaGpu {
     pub fn ffn_fused(&self, _: &str, _: &str, _: &str, _: &[f32]) -> Option<Vec<f32>> { None }
     #[allow(clippy::too_many_arguments)]
     pub fn attn_fused(&self, _: usize, _: &str, _: &str, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &[f32], _: usize, _: usize, _: usize, _: usize, _: f32, _: f32) -> Option<Vec<f32>> { None }
+    pub fn supports_resident(&self) -> bool { false }
+    pub fn ensure_hidden(&self, _: usize) -> bool { false }
+    pub fn upload_hidden(&self, _: &[f32]) -> bool { false }
+    pub fn download_hidden(&self) -> Option<Vec<f32>> { None }
+    pub fn rms_norm_on_hidden(&self, _: &str, _: usize, _: f32) -> bool { false }
+    pub fn add_hidden_from_y(&self, _: usize) -> bool { false }
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_fused_resident(&self, _: usize, _: &str, _: &str, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: usize, _: usize, _: usize, _: usize, _: usize, _: f32, _: f32) -> bool { false }
+    pub fn ffn_fused_resident(&self, _: &str, _: &str, _: &str, _: usize) -> bool { false }
     pub fn vram_used_mb(&self) -> f64 { 0.0 }
 }
