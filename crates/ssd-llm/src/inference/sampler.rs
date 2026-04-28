@@ -244,16 +244,9 @@ impl Sampler {
             MirostatMode::Disabled => {}
         }
 
-        // Apply temperature
-        let scaled: Vec<f32> = logits.iter().map(|&l| l / self.temperature).collect();
-
-        // Top-K filtering
-        let mut indexed: Vec<(usize, f32)> =
-            scaled.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let k = self.top_k.min(indexed.len());
-        let candidates: Vec<(usize, f32)> = indexed[..k].to_vec();
+        // Apply temperature scaling and select top-k via partial sort (O(n log k), no large alloc)
+        let k = self.top_k.min(logits.len());
+        let candidates: Vec<(usize, f32)> = top_k_logits(logits, self.temperature, k);
 
         // Min-P filtering: keep tokens with prob >= min_p * max_prob
         // Applied after top-k but before softmax, using pre-softmax logits
@@ -507,6 +500,44 @@ impl Sampler {
 /// Tail-Free Sampling: filter candidates by second derivative of sorted probabilities
 ///
 /// TFS computes the second derivative (discrete) of the sorted probability distribution,
+/// Select top-k logits by temperature-scaled value using a min-heap of size k.
+/// O(n log k) time, O(k) space — avoids the O(n) temp Vec and O(n log n) full sort.
+/// Returns candidates sorted descending by scaled logit value.
+fn top_k_logits(logits: &[f32], temperature: f32, k: usize) -> Vec<(usize, f32)> {
+    use std::cmp::Ordering;
+    // Min-heap ordered by scaled value (ascending) so we can evict the smallest.
+    // We wrap f32 to get a total order that treats NaN as very negative.
+    #[derive(Clone, Copy)]
+    struct Entry(usize, f32); // (token_id, scaled_logit)
+    impl PartialEq for Entry { fn eq(&self, o: &Self) -> bool { self.1 == o.1 } }
+    impl Eq for Entry {}
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) }
+    }
+    impl Ord for Entry {
+        // Min-heap: smaller value = higher priority (gets popped first)
+        fn cmp(&self, o: &Self) -> Ordering {
+            o.1.partial_cmp(&self.1).unwrap_or(Ordering::Equal)
+        }
+    }
+
+    let mut heap: std::collections::BinaryHeap<Entry> = std::collections::BinaryHeap::with_capacity(k + 1);
+    for (i, &l) in logits.iter().enumerate() {
+        let scaled = l / temperature;
+        if heap.len() < k {
+            heap.push(Entry(i, scaled));
+        } else if let Some(min) = heap.peek() {
+            if scaled > min.1 {
+                heap.pop();
+                heap.push(Entry(i, scaled));
+            }
+        }
+    }
+    let mut result: Vec<(usize, f32)> = heap.into_iter().map(|e| (e.0, e.1)).collect();
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    result
+}
+
 /// normalizes it, and accumulates from most likely to least likely. Tokens beyond the
 /// cumulative threshold `z` are removed — these are the "tail" tokens.
 fn tail_free_filter(candidates: &[(usize, f32)], z: f32) -> Vec<(usize, f32)> {
