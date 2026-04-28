@@ -1,6 +1,7 @@
 //! Transformer forward pass — layer-by-layer streaming inference with KV cache
 
-use crate::inference::attention::{multi_head_attention_fused_rope, multi_head_attention_quantized};
+use crate::cuda::CudaGpu;
+use crate::inference::attention::{attention_from_qkv, multi_head_attention_fused_rope, multi_head_attention_quantized};
 use crate::inference::feed_forward::{feed_forward, feed_forward_gpu, feed_forward_quantized};
 use crate::inference::kv_cache::KvCache;
 use crate::inference::lora::LoraManager;
@@ -32,6 +33,7 @@ fn streaming_layer_forward(
     kv_cache: &mut crate::inference::kv_cache::LayerKvCache,
     theta_base: f32,
     rms_eps: f32,
+    gpu: Option<&CudaGpu>,
 ) -> Result<()> {
     let n_embd = hidden_state.len();
     let layer_name = |suffix: &str| format!("blk.{}.{}", layer_idx, suffix);
@@ -102,27 +104,43 @@ fn streaming_layer_forward(
             }
         }
 
-        let attn_output = multi_head_attention_quantized(
-            &attn_input,
-            wq_raw,
-            tq.dtype,
-            wk_raw,
-            tk.dtype,
-            wv_raw,
-            tv.dtype,
-            wo_raw,
-            to_.dtype,
-            n_head,
-            n_head_kv,
-            q_dim,
-            kv_dim,
-            position,
-            kv_cache,
-            theta_base,
-            q_norm_w.as_deref(),
-            k_norm_w.as_deref(),
-            rms_eps,
-        );
+        // GPU fast path: use pre-uploaded dequantized weights when available.
+        let attn_output = 'attn_gpu: {
+            if let Some(g) = gpu {
+                let qn = layer_name("attn_q.weight");
+                let kn = layer_name("attn_k.weight");
+                let vn = layer_name("attn_v.weight");
+                let on = layer_name("attn_output.weight");
+                if g.has(&qn) && g.has(&kn) && g.has(&vn) && g.has(&on) {
+                    // sgemv_qkv uploads attn_input ONCE for Q, K, V (saves 2 PCIe round-trips)
+                    if let Some((q_vec, k_vec, v_vec)) = g.sgemv_qkv(&qn, &kn, &vn, &attn_input) {
+                        let head_dim = if n_head > 0 { q_dim / n_head } else { q_dim };
+                        let ctx = attention_from_qkv(
+                            q_vec, k_vec, v_vec,
+                            n_head, n_head_kv, head_dim,
+                            position, kv_cache, theta_base,
+                            q_norm_w.as_deref(), k_norm_w.as_deref(), rms_eps,
+                        );
+                        // Wo projection via GPU
+                        if let Some(wo_out) = g.sgemv(&on, &ctx) {
+                            break 'attn_gpu wo_out;
+                        }
+                    }
+                }
+            }
+            // CPU fallback (quantized matvec on raw mmap bytes)
+            multi_head_attention_quantized(
+                &attn_input,
+                wq_raw, tq.dtype,
+                wk_raw, tk.dtype,
+                wv_raw, tv.dtype,
+                wo_raw, to_.dtype,
+                n_head, n_head_kv,
+                q_dim, kv_dim,
+                position, kv_cache, theta_base,
+                q_norm_w.as_deref(), k_norm_w.as_deref(), rms_eps,
+            )
+        };
 
         // Diagnostic: check attention output magnitude
         if layer_idx <= 2 {
@@ -169,26 +187,58 @@ fn streaming_layer_forward(
     let down_tensor = gguf.find_tensor(&layer_name("ffn_down.weight"));
 
     if let (Some(tg), Some(tu), Some(td)) = (gate_tensor, up_tensor, down_tensor) {
-        let gate_raw = streamer.raw_tensor_data(tg)?;
-        let up_raw = streamer.raw_tensor_data(tu)?;
-        let down_raw = streamer.raw_tensor_data(td)?;
-
         let n_ff = tg.dimensions[1] as usize; // output dim of gate projection
 
-        let ffn_output = feed_forward_quantized(
-            &ffn_input, gate_raw, tg.dtype, up_raw, tu.dtype, down_raw, td.dtype, n_embd, n_ff,
-        );
+        // Try CUDA GPU path first; fall back to quantized CPU if any tensor is absent.
+        let gpu_done = 'gpu: {
+            let Some(gpu) = gpu else { break 'gpu false };
+            let gn = layer_name("ffn_gate.weight");
+            let un = layer_name("ffn_up.weight");
+            let dn = layer_name("ffn_down.weight");
+            if !gpu.has(&gn) || !gpu.has(&un) || !gpu.has(&dn) {
+                break 'gpu false;
+            }
+            // Fused path: gate+up SGEMV → on-device silu*had → down SGEMV.
+            // 1 htod + 1 dtoh vs the old 2 htod + 3 dtoh (saves 3 PCIe transfers/layer).
+            if let Some(ffn_out) = gpu.ffn_fused(&gn, &un, &dn, &ffn_input) {
+                for (h, f) in hidden_state.iter_mut().zip(ffn_out.iter()) {
+                    *h += f;
+                }
+                break 'gpu true;
+            }
+            // Fallback: old sgemv_gate_up path (used if NVRTC kernel unavailable).
+            let Some((mut gate, up)) = gpu.sgemv_gate_up(&gn, &un, &ffn_input) else { break 'gpu false };
+            crate::metal::compute::silu_f32(&mut gate);
+            for (g, u) in gate.iter_mut().zip(up.iter()) {
+                *g *= u;
+            }
+            let Some(ffn_out) = gpu.sgemv(&dn, &gate) else { break 'gpu false };
+            for (h, f) in hidden_state.iter_mut().zip(ffn_out.iter()) {
+                *h += f;
+            }
+            true
+        };
 
-        // Diagnostic: check FFN output magnitude
-        if layer_idx <= 2 {
-            let fo_max = ffn_output.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let fo_min = ffn_output.iter().copied().fold(f32::INFINITY, f32::min);
-            debug!("Layer {} ffn_output: max={:.4} min={:.4}", layer_idx, fo_max, fo_min);
-        }
+        if !gpu_done {
+            let gate_raw = streamer.raw_tensor_data(tg)?;
+            let up_raw = streamer.raw_tensor_data(tu)?;
+            let down_raw = streamer.raw_tensor_data(td)?;
 
-        // Residual connection
-        for (h, f) in hidden_state.iter_mut().zip(ffn_output.iter()) {
-            *h += f;
+            let ffn_output = feed_forward_quantized(
+                &ffn_input, gate_raw, tg.dtype, up_raw, tu.dtype, down_raw, td.dtype, n_embd, n_ff,
+            );
+
+            // Diagnostic: check FFN output magnitude
+            if layer_idx <= 2 {
+                let fo_max = ffn_output.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let fo_min = ffn_output.iter().copied().fold(f32::INFINITY, f32::min);
+                debug!("Layer {} ffn_output: max={:.4} min={:.4}", layer_idx, fo_max, fo_min);
+            }
+
+            // Residual connection
+            for (h, f) in hidden_state.iter_mut().zip(ffn_output.iter()) {
+                *h += f;
+            }
         }
     }
 
@@ -307,6 +357,7 @@ pub fn batch_prefill(
     token_embeddings: &[Vec<f32>], // one embedding per token
     start_position: usize,
     prefetcher: &Prefetcher,
+    gpu: Option<&CudaGpu>,
 ) -> Result<Vec<f32>> {
     batch_prefill_lora(
         gguf,
@@ -317,6 +368,7 @@ pub fn batch_prefill(
         start_position,
         prefetcher,
         None,
+        gpu,
     )
 }
 
@@ -332,6 +384,7 @@ pub fn batch_prefill_lora(
     start_position: usize,
     prefetcher: &Prefetcher,
     mut lora: Option<&mut LoraManager>,
+    gpu: Option<&CudaGpu>,
 ) -> Result<Vec<f32>> {
     let n_layers = gguf.n_layers();
     let n_embd = gguf.n_embd() as usize;
@@ -398,6 +451,7 @@ pub fn batch_prefill_lora(
                 kv_layer,
                 theta_base,
                 rms_eps,
+                gpu,
             )?;
             // Per-layer diagnostic for last token at key layers
             if t == n_tokens - 1 && (layer_idx == 0 || layer_idx == 1 || layer_idx == n_layers - 1) {
@@ -448,6 +502,7 @@ pub fn forward_pass_pub(
         position,
         prefetcher,
         None,
+        None,
     )
 }
 
@@ -468,6 +523,7 @@ fn forward_pass(
     position: usize,
     prefetcher: &Prefetcher,
     mut lora: Option<&mut LoraManager>,
+    gpu: Option<&CudaGpu>,
 ) -> Result<()> {
     let n_layers = gguf.n_layers();
     let n_embd = gguf.n_embd() as usize;
@@ -501,6 +557,7 @@ fn forward_pass(
             kv_layer,
             theta_base,
             rms_eps,
+            gpu,
         )?;
 
         prefetcher.on_layer_done(layer_idx, streamer, gguf);
@@ -984,6 +1041,75 @@ pub fn generate(
     let mut generated_tokens = Vec::new();
     let mut hidden_state = vec![0.0f32; n_embd];
 
+    // Initialize CUDA GPU and pre-upload FFN weight tensors before prefill so both
+    // prefill and decode can use the GPU path (previously this ran after prefill).
+    // 6 GB budget: all 28 FFN layers fit for Qwen3-1.7B (~144 MB/layer × 28 = ~4 GB).
+    let cuda_gpu = {
+        let mut gpu = CudaGpu::new(6_979_321_856); // 6.5 GB
+        if let Some(ref mut g) = gpu {
+            let ffn_suffixes = ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
+            let mut budget_full = false;
+            for layer_idx in 0..n_layers {
+                if budget_full { break; }
+                for &suffix in &ffn_suffixes {
+                    let name = format!("blk.{}.{}", layer_idx, suffix);
+                    if let Some(tensor) = gguf.find_tensor(&name) {
+                        if let Ok(data) = streamer.load_tensor_f32(tensor) {
+                            let out_dim = tensor.dimensions[1] as usize;
+                            let in_dim  = tensor.dimensions[0] as usize;
+                            if !g.upload(&name, &data, out_dim, in_dim) {
+                                info!("CUDA: VRAM budget reached at layer {}/{}", layer_idx, n_layers);
+                                budget_full = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            info!("CUDA: {:.0} MB loaded (FFN, {} layers)", g.vram_used_mb(), n_layers);
+
+            // Upload output projection BEFORE attn weights so it's guaranteed to fit.
+            // It's the most expensive per-token CPU op (~1.18 GB as f32, 151936×2048).
+            if let Some(emb_tensor) = gguf.find_tensor("token_embd.weight") {
+                let in_dim  = emb_tensor.dimensions[0] as usize; // 2048 (hidden dim)
+                let out_dim = emb_tensor.dimensions[1] as usize; // 151936 (vocab size)
+                if let Ok(data) = streamer.load_tensor_f32(emb_tensor) {
+                    if g.upload("output.weight", &data, out_dim, in_dim) {
+                        info!("CUDA: output.weight uploaded ({} × {})", out_dim, in_dim);
+                    } else {
+                        info!("CUDA: output.weight skipped (VRAM full)");
+                    }
+                }
+            }
+
+            // Upload attention projections (attn_q/k/v/output) with whatever remains.
+            // Priority order: FFN first (biggest decode win), output second (logits),
+            // attn layers last (fill remaining ~900 MB → ~18 layers of the 28).
+            let attn_suffixes = ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"];
+            let mut attn_layers_loaded = 0u32;
+            'attn: for layer_idx in 0..n_layers {
+                for &suffix in &attn_suffixes {
+                    let name = format!("blk.{}.{}", layer_idx, suffix);
+                    if let Some(tensor) = gguf.find_tensor(&name) {
+                        if let Ok(data) = streamer.load_tensor_f32(tensor) {
+                            let in_dim  = tensor.dimensions[0] as usize;
+                            let out_dim = tensor.dimensions[1] as usize;
+                            if !g.upload(&name, &data, out_dim, in_dim) {
+                                break 'attn;
+                            }
+                        }
+                    }
+                }
+                attn_layers_loaded += 1;
+            }
+            if attn_layers_loaded > 0 {
+                info!("CUDA: attn weights for {}/{} layers, total {:.0} MB",
+                    attn_layers_loaded, n_layers, g.vram_used_mb());
+            }
+        }
+        gpu
+    };
+
     let start = Instant::now();
 
     // Batch prefill: load only needed embedding rows (not the full 5+ GB tensor)
@@ -1018,6 +1144,7 @@ pub fn generate(
             &token_embeddings,
             0,
             &prefetcher,
+            cuda_gpu.as_ref(),
         )?;
     }
 
@@ -1038,28 +1165,29 @@ pub fn generate(
             break;
         }
 
-        // Fused RMSNorm + output projection (v1.34: single GPU dispatch)
+        // RMSNorm + output projection.
+        // GPU path: norm on CPU (2048 elems, cheap) then SGEMV on GPU (151936×2048).
+        // CPU fallback: fused quantized matvec on raw Q4K bytes.
         let mut logits = {
             let norm_w = streamer
                 .load_named_tensor_f32(gguf, "output_norm.weight")
                 .ok();
-            // AOT BYPASS: Skip Q6K output.weight, use Q4K tied path (known-correct)
-            let out_w: Option<Vec<f32>> = None;
 
-            if let (Some(nw), Some(ow)) = (norm_w.as_ref(), out_w.as_ref()) {
-                // Dedicated output.weight exists — use f32 path
-                let mc = crate::metal::compute::MetalCompute::new();
-                if let Some(ref compute) = mc {
-                    compute.fused_rmsnorm_linear_f32(&hidden_state, nw, ow, vocab_size, n_embd)
+            if let (Some(nw), Some(ref g)) = (norm_w.as_ref(), cuda_gpu.as_ref()) {
+                if g.has("output.weight") {
+                    let mut normed = hidden_state.clone();
+                    rms_norm_eps(&mut normed, nw, rms_eps);
+                    g.sgemv("output.weight", &normed).unwrap_or_else(|| vec![0.0f32; vocab_size])
                 } else {
-                    crate::metal::compute::fused_rmsnorm_linear_f32_cpu_eps(
-                        &hidden_state,
-                        nw,
-                        ow,
-                        vocab_size,
-                        n_embd,
-                        rms_eps,
-                    )
+                    // GPU present but output not uploaded — CPU fallback
+                    if let Some(emb_tensor) = gguf.find_tensor("token_embd.weight") {
+                        if let Ok(raw) = streamer.raw_tensor_data(emb_tensor) {
+                            crate::metal::compute::fused_rmsnorm_linear_quantized_cpu_eps(
+                                &hidden_state, nw, raw, emb_tensor.dtype.clone(),
+                                vocab_size, n_embd, rms_eps,
+                            )
+                        } else { vec![0.0f32; vocab_size] }
+                    } else { vec![0.0f32; vocab_size] }
                 }
             } else if let (Some(nw), Some(emb_tensor)) =
                 (norm_w.as_ref(), gguf.find_tensor("token_embd.weight"))
@@ -1149,6 +1277,7 @@ pub fn generate(
             pos,
             &prefetcher,
             None,
+            cuda_gpu.as_ref(),
         )?;
         pos += 1;
     }
@@ -1296,6 +1425,7 @@ impl<'a> StreamingGenerator<'a> {
             self.position,
             &self.prefetcher,
             None,
+            None,
         )?;
 
         self.position += 1;
@@ -1360,6 +1490,7 @@ pub fn embed(
         &token_embeddings,
         0,
         &prefetcher,
+        None,
     )?;
 
     // Apply final RMS norm
@@ -1442,6 +1573,7 @@ pub fn generate_streaming<'a>(
             &token_embeddings,
             0,
             &prefetcher,
+            None,
         )?;
     }
 
