@@ -6,7 +6,7 @@ use crate::inference::feed_forward::{feed_forward, feed_forward_gpu, feed_forwar
 use crate::inference::kv_cache::KvCache;
 use crate::inference::lora::LoraManager;
 use crate::inference::moe::{self, ExpertWeights, MoeConfig};
-use crate::inference::sampler::{MirostatMode, Sampler};
+use crate::inference::sampler::{mask_logits, MirostatMode, Sampler};
 use crate::inference::tokenizer::SimpleTokenizer;
 use crate::metal::compute::MetalCompute;
 use crate::metal::gpu::MetalGpu;
@@ -1635,8 +1635,21 @@ pub struct StreamingGenerator<'a> {
 }
 
 impl<'a> StreamingGenerator<'a> {
-    /// Get the next generated token as a string, or None if done
+    /// Get the next generated token as a string, or None if done.
     pub fn next_token(&mut self) -> Result<Option<String>> {
+        self.next_token_constrained(None)
+            .map(|opt| opt.map(|(_, text)| text))
+    }
+
+    /// Get the next token with an optional logit mask. Returns `(token_id, decoded_text)`.
+    ///
+    /// When `allowed_ids` is `Some`, all logits whose index is not in the slice are set
+    /// to `NEG_INFINITY` before sampling. Use this to implement slot-level constrained
+    /// generation (tool name, arg keys, etc.) without a separate sampling pass.
+    pub fn next_token_constrained(
+        &mut self,
+        allowed_ids: Option<&[u32]>,
+    ) -> Result<Option<(u32, String)>> {
         if self.done || self.remaining == 0 {
             return Ok(None);
         }
@@ -1650,7 +1663,7 @@ impl<'a> StreamingGenerator<'a> {
         let vocab_size = self.gguf.vocab_size() as usize;
 
         // Fused RMSNorm + output projection (v1.34)
-        let logits = {
+        let mut logits = {
             let norm_w = self
                 .streamer
                 .load_named_tensor_f32(self.gguf, "output_norm.weight")
@@ -1700,6 +1713,10 @@ impl<'a> StreamingGenerator<'a> {
             }
         };
 
+        if let Some(ids) = allowed_ids {
+            mask_logits(&mut logits, ids);
+        }
+
         let token_id = self.sampler.sample(&logits);
 
         if token_id == self.tokenizer.eos_id || token_id == 0 {
@@ -1736,7 +1753,7 @@ impl<'a> StreamingGenerator<'a> {
         self.position += 1;
         self.remaining -= 1;
 
-        Ok(Some(token_text))
+        Ok(Some((token_id, token_text)))
     }
 }
 
