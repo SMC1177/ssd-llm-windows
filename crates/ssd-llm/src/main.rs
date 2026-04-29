@@ -119,6 +119,14 @@ enum Commands {
         /// Path to GBNF grammar file for constrained generation
         #[arg(long)]
         grammar_file: Option<PathBuf>,
+
+        /// Enable agentic mode: model can call grep/read_chunk/list_symbols/find_definition
+        #[arg(long, default_value_t = false)]
+        agent: bool,
+
+        /// Root directory for agent file tools (default: current directory)
+        #[arg(long)]
+        agent_dir: Option<PathBuf>,
     },
     /// Show model info from GGUF file
     Info {
@@ -527,6 +535,8 @@ fn main() -> Result<()> {
             lora_scale,
             grammar,
             grammar_file,
+            agent,
+            agent_dir,
         } => {
             // Load grammar from string or file
             let grammar_str = if let Some(gf) = grammar_file {
@@ -720,6 +730,57 @@ fn main() -> Result<()> {
                     "KV cache: {:.2} MB",
                     result.kv_cache_bytes as f64 / (1024.0 * 1024.0)
                 );
+            } else if agent {
+                // Agentic mode: constrained tool-call loop
+                let working_dir = agent_dir
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| ".".to_string());
+
+                println!("[agent] mode active | working_dir={}", working_dir);
+
+                let tools = inference::tools::ToolRegistry::with_defaults();
+                let agent_config = inference::agent::AgentConfig {
+                    max_turns: 5,
+                    max_tokens_per_phase: max_tokens,
+                    working_dir: working_dir.clone(),
+                    trigger: "<<tool_call>>".to_string(),
+                };
+
+                // Few-shot system prompt that teaches the model the tool-call format
+                let system_prompt = build_agent_system_prompt(&prompt, &working_dir);
+
+                let start = Instant::now();
+                let result = inference::agent::run_agent(
+                    &gguf,
+                    &loader,
+                    &mut cache,
+                    &system_prompt,
+                    &config,
+                    &agent_config,
+                    &tools,
+                )?;
+
+                let elapsed = start.elapsed();
+                println!("{}", result.text);
+                println!("---");
+                println!(
+                    "Agent turns: {} tool call(s) | Time: {:.2}s",
+                    result.invocations.len(),
+                    elapsed.as_secs_f64()
+                );
+                for (i, inv) in result.invocations.iter().enumerate() {
+                    println!(
+                        "  [{}] {} args={} result_keys={}",
+                        i + 1,
+                        inv.tool,
+                        serde_json::to_string(&inv.args).unwrap_or_default(),
+                        inv.result
+                            .as_object()
+                            .map(|o| o.keys().cloned().collect::<Vec<_>>().join(","))
+                            .unwrap_or_default()
+                    );
+                }
             } else {
                 // Standard decoding
                 let start = Instant::now();
@@ -1301,4 +1362,40 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Build the few-shot system prompt that teaches the model the <<tool_call>> sentinel format.
+///
+/// Uses a concrete example so Qwen3 sees the exact structure it must reproduce.
+/// The trigger text `<<tool_call>>` is chosen to be unusual enough that the model
+/// won't emit it spontaneously, and plain enough to tokenize cleanly.
+fn build_agent_system_prompt(user_query: &str, working_dir: &str) -> String {
+    format!(
+        r#"You are a coding assistant that can search and read files to answer questions.
+
+When you need to look up information in the codebase, output the literal text <<tool_call>> followed immediately by a JSON object describing the tool call, then stop. The system will execute the tool and show you the result so you can continue your answer.
+
+Available tools:
+- grep: search for text in files. Args: {{"query": "text", "path": "optional/dir", "max_results": 20}}
+- read_chunk: read specific lines from a file. Args: {{"path": "file.rs", "start": 1, "end": 50}}
+- list_symbols: list functions/structs/types in a file. Args: {{"path": "file.rs"}}
+- find_definition: find where a symbol is defined. Args: {{"symbol": "MyStruct", "root": "optional/dir"}}
+
+Working directory: {working_dir}
+
+Example:
+User: Where is the Config struct defined?
+Assistant: I'll search for it. <<tool_call>>{{"tool": "find_definition", "args": {{"symbol": "Config", "root": "."}}}}
+<tool_result>
+{{"matches": [{{"file": "src/config.rs", "line": 12, "snippet": "pub struct Config {{"}}]}}
+</tool_result>
+The Config struct is defined in src/config.rs at line 12.
+
+Now answer the following question. Use tools if you need to look up code.
+
+User: {user_query}
+Assistant:"#,
+        working_dir = working_dir,
+        user_query = user_query
+    )
 }
