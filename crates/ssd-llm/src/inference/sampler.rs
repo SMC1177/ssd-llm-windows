@@ -606,6 +606,109 @@ fn estimate_zipf_s(p1: f32, p2: f32) -> f32 {
     (ratio.log2()).clamp(0.1, 10.0)
 }
 
+// ── Constrained generation primitives ────────────────────────────────────────
+
+/// Zero out all logits whose token ID is not in `allowed_ids`.
+///
+/// Call this on a logit slice before passing it to `Sampler::sample`. Tokens set
+/// to `f32::NEG_INFINITY` have near-zero softmax probability and will never be
+/// sampled (unless `allowed_ids` is empty, in which case nothing changes — caller
+/// must ensure at least one valid token exists).
+pub fn mask_logits(logits: &mut [f32], allowed_ids: &[u32]) {
+    if allowed_ids.is_empty() {
+        return;
+    }
+    // Build a small bitset when the vocab is the typical 150k-ish range.
+    // For the constrained slots we use (tool names, arg keys), allowed_ids is ≤ a few dozen
+    // IDs, so a sorted vec + binary search beats a full-vocab bool array.
+    let mut sorted = allowed_ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    for (i, l) in logits.iter_mut().enumerate() {
+        if sorted.binary_search(&(i as u32)).is_err() {
+            *l = f32::NEG_INFINITY;
+        }
+    }
+}
+
+/// Prefix-aware constraint for slots where a single logical option may span
+/// multiple tokens (e.g. "grep" tokenizes to ["gr", "ep"]).
+///
+/// Build once from pre-tokenized option sequences. At each decoding step, call
+/// `valid_next_tokens(prefix)` to get the set of token IDs that are valid given
+/// the tokens already emitted for this slot. When `is_complete(prefix)` returns
+/// `true`, the slot is done and the caller can move to the next schema field.
+pub struct PrefixConstraint {
+    options: Vec<Vec<u32>>,
+}
+
+impl PrefixConstraint {
+    pub fn new(options: Vec<Vec<u32>>) -> Self {
+        Self { options }
+    }
+
+    /// Returns the token IDs that are valid as the next token given `prefix`.
+    /// Empty result means `prefix` matches no option (caller should treat as error).
+    pub fn valid_next_tokens(&self, prefix: &[u32]) -> Vec<u32> {
+        let mut valid: Vec<u32> = self
+            .options
+            .iter()
+            .filter(|opt| opt.starts_with(prefix) && opt.len() > prefix.len())
+            .map(|opt| opt[prefix.len()])
+            .collect();
+        valid.sort_unstable();
+        valid.dedup();
+        valid
+    }
+
+    /// Returns `true` if `prefix` is exactly one of the options (slot complete).
+    pub fn is_complete(&self, prefix: &[u32]) -> bool {
+        self.options.iter().any(|opt| opt.as_slice() == prefix)
+    }
+}
+
+/// Rolling-window sentinel detector.
+///
+/// Push tokens one at a time; returns `true` the moment the last `N` tokens
+/// match the pre-tokenized trigger sequence. Reset with `reset()` to reuse
+/// across multiple generations.
+pub struct SentinelDetector {
+    trigger: Vec<u32>,
+    window: std::collections::VecDeque<u32>,
+}
+
+impl SentinelDetector {
+    pub fn new(trigger: Vec<u32>) -> Self {
+        let cap = trigger.len().max(1);
+        Self {
+            trigger,
+            window: std::collections::VecDeque::with_capacity(cap),
+        }
+    }
+
+    /// Push one token. Returns `true` if the sentinel was just completed.
+    pub fn push(&mut self, token: u32) -> bool {
+        self.window.push_back(token);
+        if self.window.len() > self.trigger.len() {
+            self.window.pop_front();
+        }
+        self.matches()
+    }
+
+    /// Returns `true` if the current window equals the trigger.
+    /// Always returns `false` for an empty trigger (caller misuse guard).
+    pub fn matches(&self) -> bool {
+        !self.trigger.is_empty()
+            && self.window.len() == self.trigger.len()
+            && self.window.iter().zip(self.trigger.iter()).all(|(a, b)| a == b)
+    }
+
+    /// Clear the rolling window (call between generations).
+    pub fn reset(&mut self) {
+        self.window.clear();
+    }
+}
+
 fn argmax(v: &[f32]) -> usize {
     v.iter()
         .enumerate()
@@ -851,5 +954,189 @@ mod seed_tests {
         let tokens1: Vec<u32> = (0..10).map(|_| s1.sample(&logits)).collect();
         let tokens2: Vec<u32> = (0..10).map(|_| s2.sample(&logits)).collect();
         assert_eq!(tokens1, tokens2, "Seeded Min-P sampling should be deterministic");
+    }
+}
+
+#[cfg(test)]
+mod constrained_tests {
+    use super::*;
+
+    // ── mask_logits ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn mask_logits_zeros_disallowed_tokens() {
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        mask_logits(&mut logits, &[1, 3]);
+        assert_eq!(logits[0], f32::NEG_INFINITY, "token 0 not in allowed → NEG_INF");
+        assert_eq!(logits[1], 2.0, "token 1 allowed → unchanged");
+        assert_eq!(logits[2], f32::NEG_INFINITY, "token 2 not in allowed → NEG_INF");
+        assert_eq!(logits[3], 4.0, "token 3 allowed → unchanged");
+        assert_eq!(logits[4], f32::NEG_INFINITY, "token 4 not in allowed → NEG_INF");
+    }
+
+    #[test]
+    fn mask_logits_empty_allowed_is_noop() {
+        let mut logits = vec![1.0, 2.0, 3.0];
+        mask_logits(&mut logits, &[]);
+        assert_eq!(logits, vec![1.0, 2.0, 3.0], "empty allowed → logits untouched");
+    }
+
+    #[test]
+    fn mask_logits_all_allowed_is_noop() {
+        let mut logits = vec![1.0, 2.0, 3.0];
+        mask_logits(&mut logits, &[0, 1, 2]);
+        assert_eq!(logits, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn mask_logits_deduplicates_allowed() {
+        let mut logits = vec![1.0, 2.0, 3.0];
+        // Duplicate allowed ID should not panic or corrupt
+        mask_logits(&mut logits, &[1, 1, 1]);
+        assert_eq!(logits[0], f32::NEG_INFINITY);
+        assert_eq!(logits[1], 2.0);
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn mask_logits_out_of_range_id_ignored() {
+        let mut logits = vec![1.0, 2.0];
+        // Token ID 999 is beyond logits length — should not panic
+        mask_logits(&mut logits, &[0, 999]);
+        assert_eq!(logits[0], 1.0, "token 0 allowed");
+        assert_eq!(logits[1], f32::NEG_INFINITY, "token 1 not in allowed");
+    }
+
+    #[test]
+    fn mask_then_sample_greedy_picks_allowed_argmax() {
+        let sampler = Sampler::new(0.0, 40, 0.9);
+        let mut logits = vec![0.1, 0.5, 5.0, 3.0, 0.2]; // token 2 is highest
+        // Disallow token 2 — sampler should fall back to token 3
+        mask_logits(&mut logits, &[0, 1, 3, 4]);
+        let chosen = sampler.sample(&logits);
+        assert_eq!(chosen, 3, "greedy should pick token 3 after token 2 is masked");
+    }
+
+    // ── PrefixConstraint ─────────────────────────────────────────────────────
+
+    #[test]
+    fn prefix_constraint_single_token_options() {
+        // Each option is a single token: [10], [20], [30]
+        let pc = PrefixConstraint::new(vec![vec![10], vec![20], vec![30]]);
+        let valid = pc.valid_next_tokens(&[]);
+        assert_eq!(valid, vec![10, 20, 30], "at empty prefix all starts are valid");
+        assert!(pc.is_complete(&[10]));
+        assert!(pc.is_complete(&[20]));
+        assert!(!pc.is_complete(&[99]));
+    }
+
+    #[test]
+    fn prefix_constraint_multi_token_option() {
+        // "grep" might encode as [100, 200], "read_chunk" as [100, 300, 400]
+        let pc = PrefixConstraint::new(vec![
+            vec![100, 200],         // option A
+            vec![100, 300, 400],    // option B (shares first token with A)
+            vec![500],              // option C (unique start)
+        ]);
+
+        // At empty prefix: starts are 100 and 500
+        let at_start = pc.valid_next_tokens(&[]);
+        assert_eq!(at_start, vec![100, 500]);
+
+        // After [100]: valid continuations are 200 (→ A) and 300 (→ B)
+        let after_100 = pc.valid_next_tokens(&[100]);
+        assert_eq!(after_100, vec![200, 300]);
+
+        // After [100, 200]: option A is complete, no further tokens
+        assert!(pc.valid_next_tokens(&[100, 200]).is_empty());
+        assert!(pc.is_complete(&[100, 200]));
+
+        // After [100, 300]: only 400 is valid (option B continues)
+        let after_100_300 = pc.valid_next_tokens(&[100, 300]);
+        assert_eq!(after_100_300, vec![400]);
+
+        // Invalid prefix returns empty
+        assert!(pc.valid_next_tokens(&[999]).is_empty());
+    }
+
+    #[test]
+    fn prefix_constraint_deduplicates_shared_next_tokens() {
+        // Two options that share the same second token after different firsts — doesn't apply,
+        // but two options sharing first AND second token should deduplicate next.
+        let pc = PrefixConstraint::new(vec![
+            vec![1, 2, 3],
+            vec![1, 2, 4],
+        ]);
+        // After [1]: only token 2 is valid (both options agree)
+        assert_eq!(pc.valid_next_tokens(&[1]), vec![2]);
+        // After [1, 2]: tokens 3 and 4 are valid
+        assert_eq!(pc.valid_next_tokens(&[1, 2]), vec![3, 4]);
+    }
+
+    // ── SentinelDetector ─────────────────────────────────────────────────────
+
+    #[test]
+    fn sentinel_fires_on_exact_match() {
+        let mut det = SentinelDetector::new(vec![10, 20, 30]);
+        assert!(!det.push(10));
+        assert!(!det.push(20));
+        assert!(det.push(30), "trigger should fire after full sequence");
+    }
+
+    #[test]
+    fn sentinel_does_not_fire_on_partial_match() {
+        let mut det = SentinelDetector::new(vec![10, 20, 30]);
+        assert!(!det.push(10));
+        assert!(!det.push(20));
+        // wrong third token
+        assert!(!det.push(99));
+    }
+
+    #[test]
+    fn sentinel_sliding_window_handles_false_prefix() {
+        // Push almost-trigger then correct trigger — should fire
+        let mut det = SentinelDetector::new(vec![10, 20]);
+        det.push(10);
+        det.push(99); // wrong — window is [10, 99]
+        det.push(10); // window slides to [99, 10]
+        let fired = det.push(20); // window: [10, 20] — fires
+        assert!(fired);
+    }
+
+    #[test]
+    fn sentinel_does_not_fire_before_enough_tokens() {
+        let mut det = SentinelDetector::new(vec![5, 6, 7, 8]);
+        // Push only 3 of 4 trigger tokens — must not fire
+        assert!(!det.push(5));
+        assert!(!det.push(6));
+        assert!(!det.push(7));
+    }
+
+    #[test]
+    fn sentinel_reset_clears_state() {
+        let mut det = SentinelDetector::new(vec![1, 2]);
+        det.push(1); // partial match
+        det.reset();
+        // After reset, push(2) alone must not fire
+        assert!(!det.push(2), "reset should clear partial match state");
+    }
+
+    #[test]
+    fn sentinel_single_token_trigger() {
+        let mut det = SentinelDetector::new(vec![42]);
+        assert!(!det.push(1));
+        assert!(det.push(42));
+        // Next non-matching token should not fire
+        det.reset();
+        assert!(!det.push(1));
+    }
+
+    #[test]
+    fn sentinel_empty_trigger_never_fires() {
+        // Empty trigger is a caller error; must not produce false positives.
+        let mut det = SentinelDetector::new(vec![]);
+        assert!(!det.push(0), "empty trigger must never fire");
+        assert!(!det.push(0));
+        assert!(!det.matches());
     }
 }
