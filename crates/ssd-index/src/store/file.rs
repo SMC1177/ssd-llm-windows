@@ -153,6 +153,61 @@ impl FileStore {
         Self::open_or_create(dir, e.dim(), e.tag())
     }
 
+    /// Remove all chunks whose `path` starts with `prefix`. Returns the
+    /// number of chunks removed. Path comparison normalizes Windows
+    /// backslashes to forward slashes on both sides so callers can pass
+    /// either separator regardless of how the chunk was originally
+    /// indexed.
+    ///
+    /// Safety: an empty prefix is refused (returns 0 without mutation) so
+    /// a caller cannot accidentally wipe the entire store with a blank
+    /// argument.
+    pub fn remove_by_path_prefix(&mut self, prefix: &str) -> usize {
+        if prefix.is_empty() {
+            return 0;
+        }
+        let needle = prefix.replace('\\', "/");
+
+        // Single pass: keep entries whose normalized path does NOT start
+        // with the normalized prefix. Rebuild vectors / chunks / index in
+        // lockstep so row i in vectors.bin still corresponds to line i in
+        // chunks.jsonl after the rewrite.
+        let dim = self.dim;
+        let n = self.chunks.len();
+        let mut new_vectors: Vec<f32> = Vec::with_capacity(self.vectors.len());
+        let mut new_chunks: Vec<Chunk> = Vec::with_capacity(n);
+        let mut new_index: HashMap<String, usize> = HashMap::with_capacity(n);
+        let mut removed = 0usize;
+
+        for i in 0..n {
+            let normalized = self.chunks[i].path.replace('\\', "/");
+            if normalized.starts_with(&needle) {
+                removed += 1;
+                continue;
+            }
+            let new_idx = new_chunks.len();
+            new_vectors.extend_from_slice(&self.vectors[i * dim..(i + 1) * dim]);
+            new_index.insert(self.chunks[i].id.clone(), new_idx);
+            new_chunks.push(self.chunks[i].clone());
+        }
+
+        if removed > 0 {
+            self.vectors = new_vectors;
+            self.chunks = new_chunks;
+            self.chunk_index = new_index;
+            self.dirty = true;
+        }
+        removed
+    }
+
+    /// Mark in-RAM mutations as not-to-be-persisted. Clears the dirty
+    /// flag so the `Drop` impl will NOT auto-flush. Used by tools that
+    /// perform a destructive op in RAM (e.g. dry-run prune) and want to
+    /// discard the result without writing.
+    pub fn discard_pending_changes(&mut self) {
+        self.dirty = false;
+    }
+
     /// Explicitly write vectors + chunks + manifest to disk. Clears dirty.
     pub fn flush(&mut self) -> anyhow::Result<()> {
         if !self.dirty {
@@ -631,6 +686,117 @@ mod tests {
             reopened.get_chunk("a").unwrap().unwrap().text,
             "alpha"
         );
+    }
+
+    fn chunk_with_path(id: &str, path: &str) -> Chunk {
+        Chunk {
+            id: id.to_string(),
+            text: format!("text-{}", id),
+            path: path.to_string(),
+            offset: 0,
+            len: 4,
+            lang: None,
+        }
+    }
+
+    #[test]
+    fn remove_by_path_prefix_happy_path() {
+        let dir = tmpdir("remove_happy");
+        {
+            let mut s = FileStore::create(&dir, 2, "t").unwrap();
+            s.put(&chunk_with_path("a", "src/a.rs"), &[1.0, 0.0]).unwrap();
+            s.put(&chunk_with_path("b", "src/b.rs"), &[0.0, 1.0]).unwrap();
+            s.put(&chunk_with_path("c", "src/c.rs"), &[1.0, 1.0]).unwrap();
+
+            let removed = s.remove_by_path_prefix("src/b.rs");
+            assert_eq!(removed, 1, "exactly one chunk should be removed");
+            assert_eq!(s.len(), 2);
+            assert!(s.get_chunk("a").unwrap().is_some(), "a still present");
+            assert!(s.get_chunk("c").unwrap().is_some(), "c still present");
+            assert!(s.get_chunk("b").unwrap().is_none(), "b is gone in RAM");
+            s.flush().unwrap();
+        }
+        let reopened = FileStore::open(&dir, 2, "t").unwrap();
+        assert_eq!(reopened.len(), 2, "deletion persisted to disk");
+        assert!(reopened.get_chunk("b").unwrap().is_none(), "b gone on disk");
+        assert!(reopened.get_chunk("a").unwrap().is_some());
+        assert!(reopened.get_chunk("c").unwrap().is_some());
+    }
+
+    #[test]
+    fn remove_by_path_prefix_empty_prefix_is_safety_noop() {
+        let dir = tmpdir("remove_empty");
+        let mut s = FileStore::create(&dir, 2, "t").unwrap();
+        s.put(&chunk_with_path("a", "src/a.rs"), &[1.0, 0.0]).unwrap();
+        s.put(&chunk_with_path("b", "src/b.rs"), &[0.0, 1.0]).unwrap();
+
+        let removed = s.remove_by_path_prefix("");
+        assert_eq!(removed, 0, "empty prefix must NOT delete everything");
+        assert_eq!(s.len(), 2, "store untouched");
+    }
+
+    #[test]
+    fn remove_by_path_prefix_no_match_is_noop() {
+        let dir = tmpdir("remove_nomatch");
+        let mut s = FileStore::create(&dir, 2, "t").unwrap();
+        s.put(&chunk_with_path("a", "src/a.rs"), &[1.0, 0.0]).unwrap();
+        s.put(&chunk_with_path("b", "src/b.rs"), &[0.0, 1.0]).unwrap();
+        s.flush().unwrap(); // start the prune from a clean (non-dirty) baseline
+
+        let removed = s.remove_by_path_prefix("nonexistent/");
+        assert_eq!(removed, 0);
+        assert_eq!(s.len(), 2);
+        assert!(!s.dirty, "no-match prune must not flip dirty flag");
+    }
+
+    #[test]
+    fn remove_by_path_prefix_normalizes_separators() {
+        let dir = tmpdir("remove_normalize");
+        let mut s = FileStore::create(&dir, 2, "t").unwrap();
+        // Store has Windows-style backslash path…
+        s.put(&chunk_with_path("x", "src\\foo.ts"), &[1.0, 0.0]).unwrap();
+        s.put(&chunk_with_path("y", "src/bar.ts"), &[0.0, 1.0]).unwrap();
+
+        // …caller passes forward-slash prefix.
+        let removed = s.remove_by_path_prefix("src/foo.ts");
+        assert_eq!(removed, 1, "backslash path should match forward-slash prefix");
+        assert!(s.get_chunk("x").unwrap().is_none());
+        assert!(s.get_chunk("y").unwrap().is_some());
+    }
+
+    #[test]
+    fn remove_by_path_prefix_keeps_vectors_and_chunks_aligned() {
+        let dir = tmpdir("remove_align");
+        let dim = 4;
+        let mut s = FileStore::create(&dir, dim, "t").unwrap();
+        for i in 0..6 {
+            let id = format!("id{}", i);
+            let path = if i % 2 == 0 {
+                format!("keep/{}.rs", i)
+            } else {
+                format!("drop/{}.rs", i)
+            };
+            let mut v = vec![0.0f32; dim];
+            v[i % dim] = 1.0;
+            s.put(&chunk_with_path(&id, &path), &v).unwrap();
+        }
+        let removed = s.remove_by_path_prefix("drop/");
+        assert_eq!(removed, 3);
+        s.flush().unwrap();
+
+        // Re-open and verify on-disk row count matches chunk count.
+        let reopened = FileStore::open(&dir, dim, "t").unwrap();
+        assert_eq!(reopened.len(), 3, "3 chunks remain");
+        // vectors len must equal len * dim (no row drift).
+        assert_eq!(
+            reopened.vectors.len(),
+            reopened.len() * dim,
+            "vectors.bin row count must match chunks.jsonl line count"
+        );
+        // And every remaining chunk is from the keep/ tree.
+        for c in &reopened.chunks {
+            assert!(c.path.starts_with("keep/"), "stray chunk left: {}", c.path);
+        }
     }
 
     #[test]
